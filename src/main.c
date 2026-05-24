@@ -37,6 +37,7 @@
 #define COMP_HASH_SIZE (1 << COMP_HASH_BITS)
 #define COMP_MIN_MATCH 4
 #define COMP_RAW_FLAG 0x80000000u
+#define PROGRESS_BAR_WIDTH 40
 #define ROM_BUFFER_ALIGN 0x10000
 
 #define PI_BSD_DOM1_LAT_REG ((volatile uint32_t *)0xA4600014)
@@ -129,6 +130,15 @@ typedef struct {
     uint32_t payload_size;
 } comp_block_header_t;
 
+typedef struct {
+    cart_info_t *cart;
+    size_t read_addr;
+    size_t write_addr;
+    size_t total_size;
+} dump_progress_t;
+
+static dump_progress_t dprog;
+
 static joypad_inputs_t read_controller(void) {
     static const uint64_t si_read_controller_block[8] = {
         0xff010401ffffffff,
@@ -217,6 +227,13 @@ static char printable_header_char(uint8_t ch) {
     return (ch >= 0x20 && ch <= 0x7E) ? (char)ch : '_';
 }
 
+static void set_cart_paths(cart_info_t *info, bool use_rom_dir, bool use_save_dir) {
+    snprintf(info->rom_path, sizeof(info->rom_path), "%s/%s.z64",
+             use_rom_dir ? ROM_DUMP_DIR : "sd:", info->product);
+    snprintf(info->save_path, sizeof(info->save_path), "%s/%s.sav",
+             use_save_dir ? SAVE_DUMP_DIR : "sd:", info->product);
+}
+
 static void parse_cart_info(cart_info_t *info, const uint8_t *header) {
     memcpy(info->header, header, CART_HEADER_SIZE);
 
@@ -238,8 +255,7 @@ static void parse_cart_info(cart_info_t *info, const uint8_t *header) {
     info->product[CART_PRODUCT_LENGTH] = '\0';
     info->region = header[CART_REGION_OFFSET];
 
-    snprintf(info->rom_path, sizeof(info->rom_path), ROM_DUMP_DIR "/%s.z64", info->product);
-    snprintf(info->save_path, sizeof(info->save_path), SAVE_DUMP_DIR "/%s.sav", info->product);
+    set_cart_paths(info, false, false);
 }
 
 static void cart_dma_read(void *ram, size_t cart_offset, size_t len) {
@@ -728,7 +744,7 @@ static bool wait_for_ready_game_cart(uint8_t *scratch, size_t scratch_size,
 
 static void print_header(void) {
     console_clear();
-    printf("SharkDumper\n\n");
+    printf("N64 SwapDumper\n\n");
 }
 
 static void pause_after_error(void) {
@@ -935,29 +951,18 @@ static bool write_all(int fd, const uint8_t *buf, size_t len) {
     return true;
 }
 
-static bool ensure_sd_dir(const char *path) {
-    if (mkdir(path, S_IRUSR | S_IWUSR | S_IXUSR |
-                    S_IRGRP | S_IWGRP | S_IXGRP |
-                    S_IROTH | S_IWOTH | S_IXOTH) == 0) {
-        return true;
-    }
-
-    if (errno == EEXIST) {
-        return true;
-    }
-
-    printf("Failed to create %s\nErrno: %d (%s)\n", path, errno, strerror(errno));
-    console_render();
-    return false;
-}
-
-static bool ensure_output_dirs(void) {
-    return ensure_sd_dir(ROM_DUMP_DIR) && ensure_sd_dir(SAVE_DUMP_DIR);
-}
-
 static bool file_exists(const char *path) {
     struct stat st;
     return stat(path, &st) == 0;
+}
+
+static bool dir_exists(const char *path) {
+    struct stat st;
+    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static void resolve_output_paths(cart_info_t *info) {
+    set_cart_paths(info, dir_exists(ROM_DUMP_DIR), dir_exists(SAVE_DUMP_DIR));
 }
 
 static bool confirm_save_overwrite(const char *path) {
@@ -1017,9 +1022,54 @@ static comp_block_header_t comp_read_header(const uint8_t *src) {
     return header;
 }
 
+static void draw_dump_progress(void) {
+    console_clear();
+    printf("N64 SwapDumper\n\n");
+
+    if (dprog.cart) {
+        printf("Title:   %s\n", dprog.cart->title);
+        printf("Size:    %u MiB\n\n",
+               (unsigned)(dprog.total_size / 0x100000));
+    }
+
+    {
+        int filled = dprog.total_size > 0
+            ? (int)((dprog.read_addr * PROGRESS_BAR_WIDTH) / dprog.total_size)
+            : 0;
+        if (filled > PROGRESS_BAR_WIDTH) {
+            filled = PROGRESS_BAR_WIDTH;
+        }
+        printf("Read:  [");
+        for (int i = 0; i < PROGRESS_BAR_WIDTH; i++) {
+            printf("%c", i < filled ? '*' : '-');
+        }
+        printf("] %u/%u MiB\n",
+               (unsigned)(dprog.read_addr / 0x100000),
+               (unsigned)(dprog.total_size / 0x100000));
+    }
+
+    {
+        int filled = dprog.total_size > 0
+            ? (int)((dprog.write_addr * PROGRESS_BAR_WIDTH) / dprog.total_size)
+            : 0;
+        if (filled > PROGRESS_BAR_WIDTH) {
+            filled = PROGRESS_BAR_WIDTH;
+        }
+        printf("Write: [");
+        for (int i = 0; i < PROGRESS_BAR_WIDTH; i++) {
+            printf("%c", i < filled ? '*' : '-');
+        }
+        printf("] %u/%u MiB\n",
+               (unsigned)(dprog.write_addr / 0x100000),
+               (unsigned)(dprog.total_size / 0x100000));
+    }
+
+    console_render();
+}
+
 static bool compress_cart_pass(uint8_t *comp_buf, size_t comp_cap, uint8_t *block_buf,
-                               int32_t *head, size_t rom_offset,
-                               size_t rom_size, compressed_pass_t *pass) {
+                                int32_t *head, size_t rom_offset,
+                                size_t rom_size, compressed_pass_t *pass) {
     size_t out_pos = 0;
     size_t raw_pos = rom_offset;
 
@@ -1067,6 +1117,8 @@ static bool compress_cart_pass(uint8_t *comp_buf, size_t comp_cap, uint8_t *bloc
         out_pos += payload_size;
         raw_pos += block_len;
         pass->raw_size += block_len;
+        dprog.read_addr = raw_pos;
+        draw_dump_progress();
 
         if ((comp_cap - out_pos) < (sizeof(comp_block_header_t) + 4096)) {
             break;
@@ -1096,6 +1148,7 @@ static bool write_compressed_pass_to_sd(const char *path, const uint8_t *comp_bu
     }
 
     size_t in_pos = 0;
+    size_t write_offset = pass->raw_start;
     while (in_pos < pass->comp_size) {
         if ((in_pos + sizeof(comp_block_header_t)) > pass->comp_size) {
             close(fd);
@@ -1138,6 +1191,9 @@ static bool write_compressed_pass_to_sd(const char *path, const uint8_t *comp_bu
         }
 
         in_pos += payload_size;
+        write_offset += raw_size;
+        dprog.write_addr = write_offset;
+        draw_dump_progress();
     }
 
     if (close(fd) == -1) {
@@ -1314,6 +1370,12 @@ void dump_rom(void) {
         }
     }
 
+    dprog.cart = &cart;
+    dprog.total_size = cart.selected_size;
+    dprog.read_addr = 0;
+    dprog.write_addr = 0;
+    draw_dump_progress();
+
     while (ok && dump_mode != DUMP_MODE_SAVE_ONLY && offset < cart.selected_size) {
         if (!first_pass) {
             prepare_flashcart_removal();
@@ -1327,8 +1389,6 @@ void dump_rom(void) {
         }
 
         compressed_pass_t pass = {0};
-        printf("Reading/compressing from 0x%06X...\n", (unsigned)offset);
-        console_render();
 
         if (!compress_cart_pass(comp_buf, chunk, block_buf, comp_head,
                                 offset, cart.selected_size, &pass)) {
@@ -1350,11 +1410,7 @@ void dump_rom(void) {
         swap("flashcart", "write");
         wait_for_a_press();
         remount_sd();
-        if (!ensure_output_dirs()) {
-            ok = false;
-            pause_after_error();
-            break;
-        }
+        resolve_output_paths(&cart);
 
         if (first_pass && dump_mode != DUMP_MODE_ROM_ONLY) {
             if (!confirm_save_overwrite(cart.save_path)) {
@@ -1395,11 +1451,9 @@ void dump_rom(void) {
         swap("flashcart", "write");
         wait_for_a_press();
         remount_sd();
+        resolve_output_paths(&cart);
 
-        if (!ensure_output_dirs()) {
-            ok = false;
-            pause_after_error();
-        } else if (!confirm_save_overwrite(cart.save_path)) {
+        if (!confirm_save_overwrite(cart.save_path)) {
             printf("Save write cancelled\n");
             console_render();
             ok = false;
@@ -1431,7 +1485,7 @@ void dump_to_accessory(void) {
 
     joypad_port_t port;
     if (!accessory_find(&port)) {
-        printf("No SharkDumper accessory found on any port\n");
+        printf("No N64 SwapDumper accessory found on any port\n");
         console_render();
 
         return;
