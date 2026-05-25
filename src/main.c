@@ -36,8 +36,10 @@
 #define CART_SAFE_PI_CONFIG 0x8030FFFF
 
 #define COMP_BLOCK_DEFAULT 0x20000
+#define COMP_BLOCK_FINAL 0x8000
 #define COMP_BLOCK_MAX 0x100000
 #define COMP_HASH_BITS_MAX 15
+#define COMP_HASH_BITS_FINAL 13
 #define COMP_MIN_MATCH 4
 #define COMP_SKIP_STRENGTH 5
 #define COMP_MAX_SKIP 64
@@ -154,6 +156,9 @@ typedef struct {
     size_t raw_start;
     size_t raw_size;
     size_t comp_size;
+    size_t work_offset;
+    size_t scratch_size;
+    size_t hash_size;
     size_t raw_tail_size[RAW_TAIL_BUFFER_COUNT];
     uint32_t read_kbs;
 } compressed_pass_t;
@@ -170,6 +175,16 @@ typedef struct {
     uint8_t max_skip;
     size_t max_match_len;
 } compression_settings_t;
+
+typedef struct {
+    compression_settings_t settings;
+    uint8_t *scratch_buf;
+    size_t scratch_size;
+    uint32_t *head;
+    size_t hash_size;
+    size_t work_offset;
+    size_t stream_cap;
+} compression_workspace_t;
 
 typedef struct {
     cart_info_t *cart;
@@ -2052,55 +2067,117 @@ static void comp_buf_tail_region(uint8_t *comp_buf, size_t comp_cap, size_t comp
     *tail_size = (size_t)(end - aligned_start);
 }
 
+static bool comp_workspace_setup(compression_workspace_t *work, uint8_t *comp_buf,
+                                 size_t comp_cap,
+                                 const compression_settings_t *settings,
+                                 size_t scratch_size) {
+    const size_t hash_size = ((size_t)1 << settings->hash_bits) * sizeof(work->head[0]);
+    const size_t work_size = scratch_size + hash_size;
+
+    if (comp_cap <= work_size + sizeof(comp_block_header_t)) {
+        return false;
+    }
+
+    work->settings = *settings;
+    work->scratch_size = scratch_size;
+    work->hash_size = hash_size;
+    work->work_offset = comp_cap - work_size;
+    work->stream_cap = work->work_offset;
+    work->scratch_buf = comp_buf + work->work_offset;
+    work->head = (uint32_t *)(void *)(work->scratch_buf + scratch_size);
+    return true;
+}
+
+static bool comp_workspace_use_final(compression_workspace_t *work, uint8_t *comp_buf,
+                                     size_t comp_cap,
+                                     const compression_settings_t *base_settings,
+                                     size_t scratch_size, size_t out_pos) {
+    compression_settings_t final_settings = *base_settings;
+    final_settings.block_size = COMP_BLOCK_FINAL;
+    final_settings.hash_bits = COMP_HASH_BITS_FINAL;
+
+    compression_workspace_t final_work;
+    if (!comp_workspace_setup(&final_work, comp_buf, comp_cap,
+                              &final_settings, scratch_size) ||
+        out_pos > final_work.stream_cap) {
+        return false;
+    }
+
+    *work = final_work;
+    return true;
+}
+
 static bool compress_cart_pass(uint8_t *comp_buf, size_t comp_cap,
-                               const compression_settings_t *settings, uint32_t *head,
-                               uint8_t *scratch_buf, size_t scratch_size, size_t rom_offset,
+                               const compression_settings_t *settings, size_t scratch_size,
+                               size_t rom_offset,
                                size_t rom_size, compressed_pass_t *pass) {
     size_t out_pos = 0;
     size_t raw_pos = rom_offset;
     const bool compress = settings->block_size != 0;
-    const size_t io_block_size = compress ? settings->block_size : COMP_BLOCK_MAX;
-    const size_t head_tail_size = ((size_t)1 << settings->hash_bits) * sizeof(head[0]);
     const uint64_t start_ms = get_ticks_ms();
+    compression_workspace_t work = {0};
+    bool using_final_work = false;
 
     dump_abort_requested = false;
     pass->raw_start = rom_offset;
     pass->raw_size = 0;
     pass->comp_size = 0;
+    pass->work_offset = comp_cap;
+    pass->scratch_size = 0;
+    pass->hash_size = 0;
     pass->read_kbs = 0;
     for (size_t i = 0; i < RAW_TAIL_BUFFER_COUNT; i++) {
         pass->raw_tail_size[i] = 0;
     }
 
-    if (comp_cap <= sizeof(comp_block_header_t) ||
-        (compress && (head == NULL || scratch_buf == NULL || scratch_size < io_block_size))) {
+    if (comp_cap <= sizeof(comp_block_header_t)) {
+        return false;
+    }
+
+    if (compress && !comp_workspace_setup(&work, comp_buf, comp_cap,
+                                          settings, scratch_size)) {
         return false;
     }
 
     while (raw_pos < rom_size) {
+        const compression_settings_t *active_settings = compress ? &work.settings : settings;
+        const size_t io_block_size = compress ? active_settings->block_size : COMP_BLOCK_MAX;
+        const size_t stream_cap = compress ? work.stream_cap : comp_cap;
         size_t block_len = rom_size - raw_pos;
         if (block_len > io_block_size) {
             block_len = io_block_size;
         }
 
-        if ((out_pos + sizeof(comp_block_header_t)) > comp_cap) {
+        if ((out_pos + sizeof(comp_block_header_t)) > stream_cap) {
+            if (compress && !using_final_work &&
+                comp_workspace_use_final(&work, comp_buf, comp_cap,
+                                         settings, scratch_size, out_pos)) {
+                using_final_work = true;
+                continue;
+            }
             break;
         }
 
         const size_t header_pos = out_pos;
-        const size_t payload_cap = comp_cap - (out_pos + sizeof(comp_block_header_t));
+        const size_t payload_cap = stream_cap - (out_pos + sizeof(comp_block_header_t));
         const bool raw_block_fits = block_len <= payload_cap;
         if (!compress && !raw_block_fits) {
             break;
         }
-        if (compress && !raw_block_fits && payload_cap <= COMP_SPECULATIVE_MIN_REMAINING) {
+        if (compress && !raw_block_fits && payload_cap <= (block_len / 2)) {
+            if (!using_final_work &&
+                comp_workspace_use_final(&work, comp_buf, comp_cap,
+                                         settings, scratch_size, out_pos)) {
+                using_final_work = true;
+                continue;
+            }
             break;
         }
 
         out_pos += sizeof(comp_block_header_t);
 
         uint8_t *const payload_buf = comp_buf + out_pos;
-        uint8_t *const raw_buf = compress ? scratch_buf : payload_buf;
+        uint8_t *const raw_buf = compress ? work.scratch_buf : payload_buf;
 
         cart_dma_read(raw_buf, raw_pos, block_len);
 
@@ -2110,7 +2187,7 @@ static bool compress_cart_pass(uint8_t *comp_buf, size_t comp_cap,
         if (compress) {
             const size_t compress_cap = raw_block_fits ? block_len : payload_cap;
             payload_size = comp_lz4_block(raw_buf, block_len, payload_buf,
-                                          compress_cap, head, settings);
+                                          compress_cap, work.head, active_settings);
         }
 
         if (!compress || payload_size == 0 || payload_size >= block_len) {
@@ -2119,6 +2196,12 @@ static bool compress_cart_pass(uint8_t *comp_buf, size_t comp_cap,
 
             if (!raw_block_fits) {
                 out_pos = header_pos;
+                if (compress && !using_final_work &&
+                    comp_workspace_use_final(&work, comp_buf, comp_cap,
+                                             settings, scratch_size, out_pos)) {
+                    using_final_work = true;
+                    continue;
+                }
                 break;
             }
 
@@ -2152,19 +2235,25 @@ static bool compress_cart_pass(uint8_t *comp_buf, size_t comp_cap,
     }
 
     pass->comp_size = out_pos;
+    if (compress) {
+        pass->work_offset = work.work_offset;
+        pass->scratch_size = work.scratch_size;
+        pass->hash_size = work.hash_size;
+    }
+
     uint8_t *comp_tail_buf = NULL;
     size_t comp_tail_size = 0;
-    comp_buf_tail_region(comp_buf, comp_cap, pass->comp_size,
+    comp_buf_tail_region(comp_buf, pass->work_offset, pass->comp_size,
                          &comp_tail_buf, &comp_tail_size);
 
     uint8_t *const tail_bufs[RAW_TAIL_BUFFER_COUNT] = {
-        scratch_buf,
-        (uint8_t *)head,
+        compress ? comp_buf + pass->work_offset : NULL,
+        compress ? comp_buf + pass->work_offset + pass->scratch_size : NULL,
         comp_tail_buf,
     };
     const size_t tail_caps[RAW_TAIL_BUFFER_COUNT] = {
-        scratch_size,
-        head_tail_size,
+        pass->scratch_size,
+        pass->hash_size,
         comp_tail_size,
     };
 
@@ -2488,9 +2577,6 @@ void dump_rom(void) {
     save_info_t save_info = {0};
     uint8_t *crc_buf = NULL;
     uint8_t *comp_buf = NULL;
-    uint8_t *comp_work = NULL;
-    uint8_t *scratch_buf = NULL;
-    uint32_t *comp_head = NULL;
     uint8_t *save_buf = NULL;
     size_t chunk = 0;
     size_t offset = 0;
@@ -2555,31 +2641,18 @@ void dump_rom(void) {
 
     if (ok && dump_mode != DUMP_MODE_SAVE_ONLY) {
         io_block_size = comp_settings.block_size;
-        const size_t hash_size = ((size_t)1 << comp_settings.hash_bits) * sizeof(comp_head[0]);
-        comp_work = malloc(io_block_size + hash_size);
-        if (comp_work == NULL) {
-            printf(LOC.err_alloc_compressor,
+        comp_buf = malloc_largest_rom_buffer(&chunk, mem_size);
+        if (comp_buf == NULL) {
+            printf(LOC.err_alloc_rom,
                    errno, strerror(errno));
             console_render();
             ok = false;
             pause_after_error();
         } else {
-            scratch_buf = comp_work;
-            comp_head = (uint32_t *)(void *)(comp_work + io_block_size);
-
-            comp_buf = malloc_largest_rom_buffer(&chunk, mem_size);
-            if (comp_buf == NULL) {
-                printf(LOC.err_alloc_rom,
-                       errno, strerror(errno));
-                console_render();
-                ok = false;
-                pause_after_error();
-            } else {
-                printf(LOC.rom_buffer, (unsigned)(chunk / 1024));
-                print_loc(LOC.compression_label);
-                printf(LOC.compression_blocks_short, (unsigned)(comp_settings.block_size / 1024));
-                console_render();
-            }
+            printf(LOC.rom_buffer, (unsigned)(chunk / 1024));
+            print_loc(LOC.compression_label);
+            printf(LOC.compression_blocks_short, (unsigned)(comp_settings.block_size / 1024));
+            console_render();
         }
     }
 
@@ -2614,8 +2687,7 @@ void dump_rom(void) {
 
         compressed_pass_t pass = {0};
 
-        if (!compress_cart_pass(comp_buf, chunk, &comp_settings, comp_head,
-                                scratch_buf, io_block_size,
+        if (!compress_cart_pass(comp_buf, chunk, &comp_settings, io_block_size,
                                 offset, cart.selected_size, &pass)) {
             if (dump_abort_requested) {
                 print_header();
@@ -2666,25 +2738,26 @@ void dump_rom(void) {
             save_buf = NULL;
         }
 
-        const size_t scratch_size = (comp_settings.block_size != 0) ? io_block_size : 0;
-        const size_t head_tail_size = ((size_t)1 << comp_settings.hash_bits) * sizeof(comp_head[0]);
         uint8_t *comp_tail_buf = NULL;
         size_t comp_tail_size = 0;
-        comp_buf_tail_region(comp_buf, chunk, pass.comp_size,
+        comp_buf_tail_region(comp_buf, pass.work_offset, pass.comp_size,
                              &comp_tail_buf, &comp_tail_size);
+        uint8_t *const scratch_buf = pass.scratch_size != 0
+            ? comp_buf + pass.work_offset
+            : NULL;
 
         const uint8_t *const tail_bufs[RAW_TAIL_BUFFER_COUNT] = {
             scratch_buf,
-            (const uint8_t *)comp_head,
+            pass.hash_size != 0 ? scratch_buf + pass.scratch_size : NULL,
             comp_tail_buf,
         };
         const size_t tail_caps[RAW_TAIL_BUFFER_COUNT] = {
-            scratch_size,
-            head_tail_size,
+            pass.scratch_size,
+            pass.hash_size,
             comp_tail_size,
         };
         if (!write_rom_pass_to_sd(&cart, comp_buf, &pass,
-                                  io_block_size, scratch_buf, scratch_size,
+                                  io_block_size, scratch_buf, pass.scratch_size,
                                   tail_bufs, tail_caps,
                                   offset != 0)) {
             ok = false;
@@ -2739,7 +2812,6 @@ void dump_rom(void) {
     }
 
     free(save_buf);
-    free(comp_work);
     free(comp_buf);
     free(crc_buf);
 }
