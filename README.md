@@ -1,6 +1,6 @@
 # N64 SwapDumper
 
-Cartridge-swap-based cartridge dumper for Nintendo 64, requiring only a flash cart. You can dump saves, ROM, or both. Inspired by and based on sharksaver64: https://github.com/Jhynjhiruu/sharksaver64
+Cartridge-swap-based cartridge dumper for Nintendo 64, requiring only a flash cart. You can dump saves, ROM, or both. Inspired by and based on [sharksaver64](https://github.com/Jhynjhiruu/sharksaver64) by [@Jhynjhiruu](https://github.com/Jhynjhiruu/) [@ppcasm](https://github.com/ppcasm/) [@Modman](https://github.com/RWeick/) 
 
 ## Disclaimer
 
