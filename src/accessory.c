@@ -1,9 +1,10 @@
 #include <libdragon.h>
 
-#include <inttypes.h>
 #include <string.h>
 
 #include "accessory.h"
+
+#define printf iprintf
 
 #define MAGIC_UPPER11 0x3FF
 #define MAGIC_LO      0x44
@@ -101,8 +102,8 @@ void accessory_dump_stream(joypad_port_t port, size_t cart_size) {
 
         int ret = accessory_write(port, addr, block);
         if (ret < 0) {
-            printf("Write failed at offset 0x%06" PRIXMAX " (err %d)\n",
-                   (uintmax_t)offset, ret);
+            printf("Write failed at offset 0x%06X (err %d)\n",
+                   (unsigned)offset, ret);
             console_render();
 
             return;
@@ -138,14 +139,14 @@ bool accessory_verify(joypad_port_t port, size_t cart_size) {
 
         int ret = accessory_read_block(port, addr, acc_buf);
         if (ret < 0) {
-            printf("Verify read failed at 0x%06" PRIXMAX "\n", (uintmax_t)offset);
+            printf("Verify read failed at 0x%06X\n", (unsigned)offset);
             console_render();
             ok = false;
             break;
         }
 
         if (memcmp(acc_buf, cart_buf, 32) != 0) {
-            printf("Mismatch at 0x%06" PRIXMAX "\n", (uintmax_t)offset);
+            printf("Mismatch at 0x%06X\n", (unsigned)offset);
             console_render();
             ok = false;
         }

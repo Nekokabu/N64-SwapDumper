@@ -9,11 +9,17 @@
 #include <malloc.h>
 #include <stdint.h>
 #include <string.h>
-#include <sys/stat.h>
 #include <unistd.h>
+
+#include <system.h>
+#include <fatfs/ff.h>
+#include <fatfs/diskio.h>
 
 #include "accessory.h"
 #include "pif.h"
+#include "tom_thumb_font.h"
+
+#define printf iprintf
 
 #define CART_ROM_BASE 0x10000000
 #define CART_HEADER_SIZE 0x40
@@ -48,11 +54,46 @@
 #define COMP_SPECULATIVE_MIN_REMAINING 0x10000
 #define CRC32_POLY 0xEDB88320u
 #define CHECKSUM_READ_SIZE 0x100000
-#define PROGRESS_BAR_WIDTH 40
-#define ROM_BUFFER_ALIGN 0x4000
-#define ROM_BUFFER_HEAP_RESERVE 0x20000
+#define CONSOLE_FRAMEBUFFER_WIDTH 120
+#define CONSOLE_FRAMEBUFFER_HEIGHT 48
+#define CONSOLE_H_OFFSET 128
+#define CONSOLE_V_OFFSET 9
+#define CONSOLE_H_STRETCH_PERCENT 400
+#define CONSOLE_V_STRETCH_PERCENT 200
+#define CONSOLE_PROGRESS_BAR_WIDTH 8
+#define CONSOLE_ORIGIN_WRAP_PIXELS 4
+#define PROGRESS_BAR_WIDTH CONSOLE_PROGRESS_BAR_WIDTH
+#define ROM_BUFFER_ALIGN 0x1000
+#define ROM_BUFFER_HEAP_RESERVE 0x10000
 #define RAW_TAIL_BUFFER_COUNT 3
 #define ARRAY_COUNT(arr) (sizeof(arr) / sizeof((arr)[0]))
+#define MINI_CONSOLE_COLS (CONSOLE_FRAMEBUFFER_WIDTH / TOM_THUMB_CELL_WIDTH)
+#define MINI_CONSOLE_ROWS (CONSOLE_FRAMEBUFFER_HEIGHT / TOM_THUMB_CELL_HEIGHT)
+#define MINI_CONSOLE_SIZE (MINI_CONSOLE_COLS * MINI_CONSOLE_ROWS + 1)
+#define MINI_CONSOLE_X 0
+#define MINI_CONSOLE_Y 0
+#define MINI_CONSOLE_FG 0xFFFF
+#define MINI_CONSOLE_BG 0x18C6
+#define CONSOLE_RIGHT_EXTEND_PIXELS CONSOLE_ORIGIN_WRAP_PIXELS
+#define VI_H_VIDEO_REG ((volatile uint32_t *)0xA4400024)
+#define VI_ORIGIN_REG ((volatile uint32_t *)0xA4400004)
+#define VI_V_VIDEO_REG ((volatile uint32_t *)0xA4400028)
+#define VI_X_SCALE_REG ((volatile uint32_t *)0xA4400030)
+#define VI_Y_SCALE_REG ((volatile uint32_t *)0xA4400034)
+#define VI_CTRL_REG ((volatile uint32_t *)0xA4400000)
+#define VI_PIXEL_ADVANCE_MASK (0xF << 12)
+#define VI_PIXEL_ADVANCE(value) (((value) & 0xF) << 12)
+#define VI_AA_MODE_MASK (0x3 << 8)
+#define VI_AA_MODE_NONE (0x3 << 8)
+#define CONSOLE_VI_BASE_OUTPUT_WIDTH ((CONSOLE_FRAMEBUFFER_WIDTH * CONSOLE_H_STRETCH_PERCENT) / 100)
+#define CONSOLE_VI_OUTPUT_WIDTH (((CONSOLE_FRAMEBUFFER_WIDTH + CONSOLE_RIGHT_EXTEND_PIXELS) * CONSOLE_H_STRETCH_PERCENT) / 100)
+#define CONSOLE_VI_OUTPUT_HEIGHT ((CONSOLE_FRAMEBUFFER_HEIGHT * CONSOLE_V_STRETCH_PERCENT) / 100)
+#define VI_X_SCALE_VALUE ((0x400 * CONSOLE_FRAMEBUFFER_WIDTH + (CONSOLE_VI_BASE_OUTPUT_WIDTH / 2)) / CONSOLE_VI_BASE_OUTPUT_WIDTH)
+#define VI_X_SCALE_CONSOLE ((0x200 << 16) | (VI_X_SCALE_VALUE & 0xFFF))
+#define VI_Y_SCALE_VALUE ((0x400 * CONSOLE_FRAMEBUFFER_HEIGHT + (CONSOLE_VI_OUTPUT_HEIGHT / 2)) / CONSOLE_VI_OUTPUT_HEIGHT)
+#define VI_Y_SCALE_CONSOLE (VI_Y_SCALE_VALUE & 0xFFF)
+#define VI_VIDEO_START(value) (((value) >> 16) & 0x3FF)
+#define VI_VIDEO_SET(start, end) ((((start) & 0x3FF) << 16) | ((end) & 0x3FF))
 
 #define PI_BSD_DOM1_LAT_REG ((volatile uint32_t *)0xA4600014)
 #define PI_BSD_DOM1_PWD_REG ((volatile uint32_t *)0xA4600018)
@@ -206,13 +247,9 @@ typedef struct {
     const char *revision_suffix_fmt;
     const char *press_a_continue;
     const char *prompt_left_right_confirm;
-    const char *prompt_left_right_mode;
-    const char *prompt_left_right_file;
     const char *prompt_restore_anyway;
-    const char *prompt_restore_anyway_spaced;
     const char *prompt_overwrite_cancel;
     const char *prompt_continue_cancel;
-    const char *prompt_restore_cancel;
     const char *prompt_retry_reinsert;
     const char *prompt_reset_now;
     const char *prompt_swap;
@@ -330,7 +367,6 @@ typedef struct {
     const char *clear_title;
     const char *clear_warning;
     const char *clear_second_warning;
-    const char *prompt_clear_first;
     const char *prompt_clear_second;
     const char *clearing_save;
     const char *clear_verify_failed;
@@ -338,144 +374,606 @@ typedef struct {
 } loc_t;
 
 static const loc_t LOC = {
-    .app_header = "N64 SwapDumper v0.3 (Pool Shark)\n\n",
+    .app_header = "N64 SwapDumper\n",
     .newline = "\n",
     .revision_suffix_fmt = " (%c)",
-    .press_a_continue = "Press A to continue\n",
-    .prompt_left_right_confirm = "Left/Right: change\nA: confirm  B: cancel\n",
-    .prompt_left_right_mode = "Left/Right: change mode\nA: confirm  B: cancel\n",
-    .prompt_left_right_file = "Left/Right: choose file\nA: confirm  B: cancel\n",
-    .prompt_restore_anyway = "A: restore anyway  B: cancel\n",
-    .prompt_restore_anyway_spaced = "\nA: restore anyway  B: cancel\n",
-    .prompt_overwrite_cancel = "A: overwrite  B: cancel\n",
-    .prompt_continue_cancel = "A: continue  B: cancel\n",
-    .prompt_restore_cancel = "A: restore  B: cancel\n",
-    .prompt_retry_reinsert = "Remove and reinsert the cartridge,\nthen press A to retry\n",
-    .prompt_reset_now = "Press the reset button now\n",
-    .prompt_swap = "Swap to the %s now, then press the A button to %s!\n",
-    .prompt_flashcart_retry = "Failed to initialise flashcart\nPress A to retry\n",
-    .prompt_sd_retry = "Failed to initialise SD card\nPress A to retry\n",
-    .prompt_mount_retry = "Failed to mount SD filesystem\nErrno: %d (%s)\nPress A to retry\n",
-    .err_crc_scratch_small = "CRC scratch buffer too small\n",
-    .err_need_got = "Need 0x%06X bytes, got 0x%06X\n",
-    .err_invalid_header = "Invalid cartridge header: %02X %02X %02X %02X\n",
-    .checking_cart_crc = "Checking cartridge CRC...\n",
+    .press_a_continue = "A: OK\n",
+    .prompt_left_right_confirm = "Left/Right: change  A: OK  B: back\n",
+    .prompt_restore_anyway = "A: restore  B: back\n",
+    .prompt_overwrite_cancel = "A: overwrite  B: back\n",
+    .prompt_continue_cancel = "A: OK  B: back\n",
+    .prompt_retry_reinsert = "Reinsert cart+press A\n",
+    .prompt_reset_now = "Press RESET now\n",
+    .prompt_swap = "Swap to %s then A to %s\n",
+    .prompt_flashcart_retry = "Flashcart init failed\nA: retry\n",
+    .prompt_sd_retry = "SD init failed\nA: retry\n",
+    .prompt_mount_retry = "SD mount failed (%d)\nA: retry\n",
+    .err_crc_scratch_small = "CRC buf too small\n",
+    .err_need_got = "Need %06X, got %06X\n",
+    .err_invalid_header = "Bad header: %02X %02X %02X %02X\n",
+    .checking_cart_crc = "Checking CRC...\n",
     .crc_ok = "CRC OK (%s)\n",
-    .err_header_changed = "Cartridge header changed during CRC read\n",
-    .err_crc_failed = "CRC check failed\n",
-    .crc_expected = "Expected: %08" PRIX32 " %08" PRIX32 "\n",
-    .crc_read_as = "Read as:  %08" PRIX32 " %08" PRIX32 " (%s)\n",
-    .err_different_cart = "Different cartridge inserted\n",
-    .detecting_rom_size = "Detecting ROM size...\n",
-    .err_size_scratch_small = "ROM size scratch buffer too small\n",
-    .detected_rom_size = "Detected ROM size: %u MiB\n",
+    .err_header_changed = "Header changed\n",
+    .err_crc_failed = "CRC failed\n",
+    .crc_expected = "Want: %08" PRIX32 " %08" PRIX32 "\n",
+    .crc_read_as = "Got:  %08" PRIX32 " %08" PRIX32 " (%s)\n",
+    .err_different_cart = "Wrong cart\n",
+    .detecting_rom_size = "Detecting size...\n",
+    .err_size_scratch_small = "Size buf too small\n",
+    .detected_rom_size = "Detected: %u MiB\n",
     .title_label = "Title: %s",
     .product_label = "Product: %s",
     .rev_label = "  Rev: %c",
     .region_label = "  Region: %c\n",
     .crc_label = "CRC: %08" PRIX32 " %08" PRIX32 "\n",
-    .rom_file_label = "ROM file: %s\n\n",
-    .rom_size_label = "ROM size: %u MiB",
+    .rom_file_label = "File: %s\n",
+    .rom_size_label = "Size: %u MiB",
     .detected_suffix = " (detected)",
-    .dump_mode_label = "Dump mode: %s\n\n",
-    .mode_rom_only = "ROM only",
-    .mode_save_only = "Save only",
-    .mode_rom_save = "ROM + save",
-    .flash_restore_unsupported = "FlashRAM write failed\n",
-    .flash_erasing = "Erasing FlashRAM sector %u/%u...\n",
-    .flash_programming = "Programming FlashRAM %u/%u pages...\n",
-    .flash_wait_timeout = "FlashRAM status wait timed out\n",
-    .flash_status_failed = "FlashRAM status failed: %08" PRIX32 "\n",
-    .cart_crc32_title = "Calculating cartridge CRC32\n",
-    .cart_crc32_subtitle = "for dump verification.\n\n",
-    .sd_crc32_title = "Verifying dumped ROM...\n",
-    .fmt_failed_open = "Failed to open %s\nErrno: %d (%s)\n",
-    .fmt_failed_read = "Failed to read %s\nErrno: %d (%s)\n",
-    .fmt_failed_seek = "Failed to seek %s\nErrno: %d (%s)\n",
-    .fmt_failed_write = "Failed to write %s\nErrno: %d (%s)\n",
-    .fmt_failed_close = "Failed to close %s\nErrno: %d (%s)\n",
-    .restore_name_unrecognized = "Save file name is not recognized\n\n",
-    .expected_like = "Expected something like %s\n",
-    .restore_identity_warning = "Save may be for a different cart\n\n",
+    .dump_mode_label = "Mode: %s\n",
+    .mode_rom_only = "ROM",
+    .mode_save_only = "Save",
+    .mode_rom_save = "Both",
+    .flash_restore_unsupported = "Flash write failed\n",
+    .flash_erasing = "Erase Flash %u/%u\n",
+    .flash_programming = "Write Flash %u/%u\n",
+    .flash_wait_timeout = "Flash timeout\n",
+    .flash_status_failed = "Flash status: %08" PRIX32 "\n",
+    .cart_crc32_title = "Cart CRC32\n",
+    .cart_crc32_subtitle = "\n",
+    .sd_crc32_title = "Verify ROM...\n",
+    .fmt_failed_open = "Open failed: %s (%d)\n",
+    .fmt_failed_read = "Read failed: %s (%d)\n",
+    .fmt_failed_seek = "Seek failed: %s (%d)\n",
+    .fmt_failed_write = "Write failed: %s (%d)\n",
+    .fmt_failed_close = "Close failed: %s (%d)\n",
+    .restore_name_unrecognized = "Unknown save name\n\n",
+    .expected_like = "Expected: %s\n",
+    .restore_identity_warning = "Save may differ\n\n",
     .file_label = "File: %s\n",
     .plain_line = "%s\n",
-    .plain_line_spaced = "%s\n\n",
-    .cart_label = "Cart: %s\n\n",
+    .plain_line_spaced = "%s\n",
+    .cart_label = "Cart: %s\n",
     .region_differs = "Region differs\n",
     .revision_differs = "Revision differs\n",
-    .restore_does_not_match = "Save file does not match cartridge\n\n",
-    .restore_save_title = "Restore save\n\n",
+    .restore_does_not_match = "Save does not match\n\n",
+    .restore_save_title = "Restore\n\n",
     .dir_label = "Dir: %s\n",
     .bytes_line = "%u bytes\n\n",
-    .err_alloc_save = "Failed to allocate save buffer\nErrno: %d (%s)\n",
-    .save_exists = "Save file already exists:\n%s\n\n",
-    .progress_title_line = "Title:   %s",
-    .progress_size = "Size:    %u MiB\n\n",
-    .progress_read = "Read:  [",
-    .progress_bar_end = "] %u/%u MiB\n",
-    .mib_progress = "%u/%u MiB\n",
-    .progress_speed = "Speed: %u KiB/s\n",
-    .progress_write = "Write: [",
-    .err_decompress_chunk = "Failed to decompress ROM chunk\n",
-    .save_write_cancelled = "Save write cancelled\n",
-    .err_alloc_crc = "Failed to allocate CRC buffer\nErrno: %d (%s)\n",
-    .err_alloc_compressor = "Failed to allocate compressor buffers\nErrno: %d (%s)\n",
-    .err_alloc_rom = "Failed to allocate ROM buffer\nErrno: %d (%s)\n",
-    .reading_save = "Reading save (%s, %u bytes)...\n",
-    .err_read_save_data = "Failed to read save data\n",
-    .rom_buffer = "ROM buffer: %u KiB\n",
-    .compression_label = "Compression: ",
-    .compression_blocks_short = "%u KiB blocks\n",
-    .cart_crc32_result = "Cartridge CRC32: %08" PRIX32 "\n",
+    .err_alloc_save = "Save alloc failed (%d)\n",
+    .save_exists = "Overwrite?\n%s\n\n",
+    .progress_title_line = "%s",
+    .progress_size = "%u MB\n",
+    .progress_read = "Read: (",
+    .progress_bar_end = ") %u/%u MB\n",
+    .mib_progress = "%u/%u MB\n",
+    .progress_speed = "%u KB/s\n",
+    .progress_write = "Write: (",
+    .err_decompress_chunk = "Decompress failed\n",
+    .save_write_cancelled = "Save cancelled\n",
+    .err_alloc_crc = "CRC alloc failed (%d)\n",
+    .err_alloc_compressor = "Comp alloc failed (%d)\n",
+    .err_alloc_rom = "ROM alloc failed (%d)\n",
+    .reading_save = "Read save %s, %u B\n",
+    .err_read_save_data = "Save read failed\n",
+    .rom_buffer = "Buf: %u KB\n",
+    .compression_label = "Comp: ",
+    .compression_blocks_short = "%u KB blocks\n",
+    .cart_crc32_result = "CRC32: %08" PRIX32 "\n",
     .chunk_cancelled = "Chunk cancelled\n\n",
-    .err_compress_pass = "Failed to compress ROM pass\n",
-    .buffered_range = "Buffered 0x%06X - 0x%06X\n",
-    .compressed_summary = "Compressed: %u KiB -> %u KiB",
-    .raw_tail_summary = " + %u KiB raw",
-    .wrote_save = "Wrote save to %s\n",
-    .wrote_chunk = "Wrote chunk 0x%06X - 0x%06X\n",
-    .full_rom_crc32 = "Full ROM CRC32\n\n",
-    .checksum_status = "%s\n\n",
+    .err_compress_pass = "Compress failed\n",
+    .buffered_range = "Buf %06X-%06X\n",
+    .compressed_summary = "%u KB -> %u KB",
+    .raw_tail_summary = " + %u KB raw",
+    .wrote_save = "Wrote %s\n",
+    .wrote_chunk = "Wrote %06X-%06X\n",
+    .full_rom_crc32 = "Full CRC32\n",
+    .checksum_status = "%s\n",
     .cart_crc_line = "Cart: %08" PRIX32 "\n",
-    .sd_crc_line = "SD:   %08" PRIX32 "\n\n",
+    .sd_crc_line = "SD:   %08" PRIX32 "\n",
     .checksum_matches = "Verified!\n",
-    .checksum_mismatch = "CHECKSUM MISMATCH - BAD DUMP\n",
-    .success = "Success!\n",
-    .err_no_accessory = "No N64 SwapDumper accessory found on any port\n",
-    .accessory_found = "Accessory found on port %d\n",
-    .streaming_accessory = "Streaming dump to controller port %d...\n",
-    .verifying = "Verifying...\n",
+    .checksum_mismatch = "BAD DUMP - CRC MISMATCH\n",
+    .success = "Done!\n",
+    .err_no_accessory = "No accessory found\n",
+    .accessory_found = "Accessory: port %d\n",
+    .streaming_accessory = "Streaming to port %d...\n",
+    .verifying = "Verify...\n",
     .no_sav_files = "No .sav files found\n\n",
     .last_tried = "Last tried: %s\n",
-    .err_alloc_verify = "Failed to allocate verify buffer\nErrno: %d (%s)\n",
-    .save_too_small = "Save file is too small\n\n",
-    .save_too_large = "Save file is larger than cartridge\n\n",
+    .err_alloc_verify = "Verify alloc failed (%d)\n",
+    .save_too_small = "Save too small\n",
+    .save_too_large = "Save too large\n",
     .file_bytes = "File: %u bytes\n",
-    .cart_save_bytes = "Cart: %s, %u bytes\n\n",
-    .truncate_restore = "Only the first %u bytes will be restored.\n\n",
+    .cart_save_bytes = "Cart: %s, %u bytes\n",
+    .truncate_restore = "Restoring first %u bytes.\n",
     .restore_file_line = "Restore %s\n",
     .restore_to_title = "to %s",
-    .restore_confirm_body = "?\n\nThis will overwrite the cartridge save.\n\n",
-    .writing_save = "Writing save (%s)...\n",
-    .restore_verify_failed = "Save restore verify failed\n",
-    .restore_success = "Save restored successfully\n",
-    .err_ique = "This program cannot be used on an iQue Player!\n",
-    .main_dump_sd = "A: Dump cartridge to SD card\n",
-    .main_dump_accessory = "B: Dump cartridge to controller accessory\n",
-    .main_restore = "C-Up: Restore save from SD card\n",
-    .main_clear_save = "Z+Down: Clear cartridge save data\n",
-    .clear_title = "Clear cartridge save\n\n",
-    .clear_warning = "This will erase the cartridge save data.\n\n",
-    .clear_second_warning = "Last chance. This cannot be undone.\n\n",
-    .prompt_clear_first = "A: continue  B: cancel\n",
-    .prompt_clear_second = "Hold L+R+Z+Start to erase  B: cancel\n",
-    .clearing_save = "Clearing save (%s, %u bytes)...\n",
-    .clear_verify_failed = "Save clear verify failed\n",
-    .clear_success = "Save data cleared successfully. What have you done?\n",
+    .restore_confirm_body = "?\nOverwrites cart save.\n",
+    .writing_save = "Write save %s\n",
+    .restore_verify_failed = "Restore verify failed\n",
+    .restore_success = "Save restored\n",
+    .err_ique = "iQue unsupported\n",
+    .main_dump_sd = "A: Dump to SD\n",
+    .main_dump_accessory = "B: Dump to accessory\n",
+    .main_restore = "C-Up: Restore save\n",
+    .main_clear_save = "Z+Down: Clear save\n",
+    .clear_title = "Clear save\n",
+    .clear_warning = "This erases cart save.\n",
+    .clear_second_warning = "Last chance.\n",
+    .prompt_clear_second = "L+R+Z+Start: erase  B: back\n",
+    .clearing_save = "Clear save %s, %u B\n",
+    .clear_verify_failed = "Clear verify failed\n",
+    .clear_success = "Save cleared\n",
 };
 
 static dump_progress_t dprog;
 static bool dump_abort_requested = false;
+
+static FATFS sd_fat;
+static char sdfs_prefix[] = "sd:/";
+static char sdfs_drive[3] = "";
+static bool sdfs_mounted = false;
+#define FAT_VOLUME_SD 0
+#define MAX_FAT_FILES 2
+
+static FIL fat_files[MAX_FAT_FILES];
+static DIR find_dir;
+
+__attribute__((weak, noreturn))
+void debug_assert_func_f(const char *file, int line, const char *func,
+                         const char *failedexpr, const char *msg, ...) {
+    (void)file;
+    (void)line;
+    (void)func;
+    (void)failedexpr;
+    (void)msg;
+
+    while (true) {
+        continue;
+    }
+}
+
+__attribute__((weak, noreturn))
+void debug_assert_func(const char *file, int line, const char *func,
+                       const char *failedexpr) {
+    debug_assert_func_f(file, line, func, failedexpr, NULL);
+}
+
+__attribute__((weak))
+void __debug_backtrace(FILE *out, bool skip_exception) {
+    (void)out;
+    (void)skip_exception;
+}
+
+__attribute__((weak))
+void __inspector_exception(exception_t *ex) {
+    (void)ex;
+}
+
+__attribute__((weak, noreturn))
+void __rsp_crash(const char *file, int line, const char *func, const char *msg, ...) {
+    (void)file;
+    (void)line;
+    (void)func;
+    (void)msg;
+
+    while (true) {
+        continue;
+    }
+}
+
+__attribute__((weak))
+bool __sprite_upgrade(sprite_t *sprite) {
+    (void)sprite;
+    return false;
+}
+
+__attribute__((weak))
+const char *__mips_gpr[34] = {
+    "zr", "at", "v0", "v1", "a0", "a1", "a2", "a3",
+    "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7",
+    "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7",
+    "t8", "t9", "k0", "k1", "gp", "sp", "s8", "ra",
+    "lo", "hi",
+};
+
+__attribute__((weak))
+const char *__mips_fpreg[32] = {
+    "$f0", "$f1", "$f2", "$f3", "$f4", "$f5", "$f6", "$f7",
+    "$f8", "$f9", "$f10", "$f11", "$f12", "$f13", "$f14", "$f15",
+    "$f16", "$f17", "$f18", "$f19", "$f20", "$f21", "$f22", "$f23",
+    "$f24", "$f25", "$f26", "$f27", "$f28", "$f29", "$f30", "$f31",
+};
+
+__attribute__((weak))
+DSTATUS disk_initialize(BYTE pdrv) {
+    if (pdrv != FAT_VOLUME_SD) {
+        return STA_NOINIT;
+    }
+    return cart_card_init() ? STA_NOINIT : 0;
+}
+
+__attribute__((weak))
+DSTATUS disk_status(BYTE pdrv) {
+    return (pdrv == FAT_VOLUME_SD) ? 0 : STA_NOINIT;
+}
+
+__attribute__((weak))
+DRESULT disk_read(BYTE pdrv, BYTE *buff, LBA_t sector, UINT count) {
+    if (pdrv != FAT_VOLUME_SD) {
+        return RES_PARERR;
+    }
+    return cart_card_rd_dram(buff, sector, count) ? RES_ERROR : RES_OK;
+}
+
+__attribute__((weak))
+DRESULT disk_write(BYTE pdrv, const BYTE *buff, LBA_t sector, UINT count) {
+    if (pdrv != FAT_VOLUME_SD) {
+        return RES_PARERR;
+    }
+    return cart_card_wr_dram(buff, sector, count) ? RES_ERROR : RES_OK;
+}
+
+__attribute__((weak))
+DRESULT disk_ioctl(BYTE pdrv, BYTE cmd, void *buff) {
+    (void)buff;
+    if (pdrv != FAT_VOLUME_SD) {
+        return RES_PARERR;
+    }
+    return (cmd == CTRL_SYNC) ? RES_OK : RES_PARERR;
+}
+
+__attribute__((weak))
+DWORD get_fattime(void) {
+    return (DWORD)((2026 - 1980) << 25 | 1 << 21 | 1 << 16);
+}
+
+static void fat_set_errno(FRESULT err) {
+    switch (err) {
+    case FR_OK: return;
+    case FR_DISK_ERR: errno = EIO; return;
+    case FR_NOT_READY: errno = EBUSY; return;
+    case FR_NO_FILE:
+    case FR_NO_PATH: errno = ENOENT; return;
+    case FR_INVALID_NAME:
+    case FR_INVALID_OBJECT:
+    case FR_INVALID_PARAMETER: errno = EINVAL; return;
+    case FR_DENIED: errno = EACCES; return;
+    case FR_EXIST: errno = EEXIST; return;
+    case FR_WRITE_PROTECTED: errno = EROFS; return;
+    case FR_INVALID_DRIVE:
+    case FR_NOT_ENABLED:
+    case FR_NO_FILESYSTEM: errno = ENODEV; return;
+    case FR_TIMEOUT: errno = ETIMEDOUT; return;
+    case FR_LOCKED: errno = EBUSY; return;
+    case FR_NOT_ENOUGH_CORE: errno = ENOMEM; return;
+    case FR_TOO_MANY_OPEN_FILES: errno = EMFILE; return;
+    default: errno = EIO; return;
+    }
+}
+
+static void *fat_open(char *name, int flags) {
+    int slot = 0;
+    while (slot < MAX_FAT_FILES && fat_files[slot].obj.fs != NULL) {
+        slot++;
+    }
+    if (slot == MAX_FAT_FILES) {
+        errno = EMFILE;
+        return NULL;
+    }
+
+    int fat_flags = 0;
+    if ((flags & O_ACCMODE) == O_RDONLY) {
+        fat_flags |= FA_READ;
+    }
+    if ((flags & O_ACCMODE) == O_WRONLY) {
+        fat_flags |= FA_WRITE;
+    }
+    if ((flags & O_ACCMODE) == O_RDWR) {
+        fat_flags |= FA_READ | FA_WRITE;
+    }
+    if ((flags & O_APPEND) == O_APPEND) {
+        fat_flags |= FA_OPEN_APPEND;
+    }
+    if ((flags & O_TRUNC) == O_TRUNC) {
+        fat_flags |= FA_CREATE_ALWAYS;
+    }
+    if ((flags & O_CREAT) == O_CREAT) {
+        fat_flags |= ((flags & O_EXCL) == O_EXCL) ? FA_CREATE_NEW : FA_OPEN_ALWAYS;
+    } else {
+        fat_flags |= FA_OPEN_EXISTING;
+    }
+
+    FRESULT res = f_open(&fat_files[slot], name, fat_flags);
+    if (res != FR_OK) {
+        fat_set_errno(res);
+        fat_files[slot].obj.fs = NULL;
+        return NULL;
+    }
+
+    return &fat_files[slot];
+}
+
+static int fat_read(void *file, uint8_t *ptr, int len) {
+    UINT read = 0;
+    FRESULT res = f_read(file, ptr, len, &read);
+    if (res != FR_OK) {
+        fat_set_errno(res);
+        return -1;
+    }
+    return (int)read;
+}
+
+static int fat_write(void *file, uint8_t *ptr, int len) {
+    UINT written = 0;
+    FRESULT res = f_write(file, ptr, len, &written);
+    if (res != FR_OK) {
+        fat_set_errno(res);
+        return -1;
+    }
+    return (int)written;
+}
+
+static int fat_close(void *file) {
+    FRESULT res = f_close(file);
+    if (res != FR_OK) {
+        fat_set_errno(res);
+        return -1;
+    }
+    return 0;
+}
+
+static int fat_lseek(void *file, int offset, int whence) {
+    FIL *f = file;
+    FSIZE_t dest = 0;
+    switch (whence) {
+    case SEEK_SET: dest = (FSIZE_t)offset; break;
+    case SEEK_CUR: dest = f_tell(f) + offset; break;
+    case SEEK_END: dest = f_size(f) + offset; break;
+    default: errno = EINVAL; return -1;
+    }
+
+    FRESULT res = f_lseek(f, dest);
+    if (res != FR_OK) {
+        fat_set_errno(res);
+        return -1;
+    }
+    return (int)f_tell(f);
+}
+
+static int fat_unlink(char *name) {
+    FRESULT res = f_unlink(name);
+    if (res != FR_OK) {
+        fat_set_errno(res);
+        return -1;
+    }
+    return 0;
+}
+
+static int fat_findnext_common(dir_t *dir) {
+    FILINFO info;
+    FRESULT res = f_readdir(&find_dir, &info);
+    if (res != FR_OK) {
+        fat_set_errno(res);
+        return -1;
+    }
+    if (info.fname[0] == '\0') {
+        f_closedir(&find_dir);
+        return -1;
+    }
+
+    strncpy(dir->d_name, info.fname, sizeof(dir->d_name) - 1);
+    dir->d_name[sizeof(dir->d_name) - 1] = '\0';
+    dir->d_type = (info.fattrib & AM_DIR) ? DT_DIR : DT_REG;
+    dir->d_size = (int64_t)info.fsize;
+    return 0;
+}
+
+static int fat_findfirst(char *name, dir_t *dir) {
+    FRESULT res = f_opendir(&find_dir, name);
+    if (res != FR_OK) {
+        fat_set_errno(res);
+        return -1;
+    }
+    return fat_findnext_common(dir);
+}
+
+static int fat_findnext2(const char *path, dir_t *dir) {
+    (void)path;
+    return fat_findnext_common(dir);
+}
+
+static filesystem_t fat_fs = {
+    .open = fat_open,
+    .lseek = fat_lseek,
+    .read = fat_read,
+    .write = fat_write,
+    .close = fat_close,
+    .unlink = fat_unlink,
+    .findfirst = fat_findfirst,
+    .findnext2 = fat_findnext2,
+};
+
+static bool sdfs_mount(const char *prefix, int npart) {
+    if (sdfs_mounted) {
+        return true;
+    }
+
+    if (cart_init() < 0) {
+        return false;
+    }
+
+    if (cart_card_init() < 0) {
+        return false;
+    }
+
+    if (npart >= 0) {
+        sdfs_drive[0] = (char)('0' + npart);
+        sdfs_drive[1] = ':';
+        sdfs_drive[2] = '\0';
+    } else {
+        sdfs_drive[0] = '\0';
+    }
+
+    FRESULT res = f_mount(&sd_fat, sdfs_drive, 1);
+    if (res != FR_OK) {
+        fat_set_errno(res);
+        return false;
+    }
+
+    strncpy(sdfs_prefix, prefix, sizeof(sdfs_prefix) - 1);
+    sdfs_prefix[sizeof(sdfs_prefix) - 1] = '\0';
+    attach_filesystem(sdfs_prefix, &fat_fs);
+    sdfs_mounted = true;
+    return true;
+}
+
+static void sdfs_unmount(void) {
+    if (!sdfs_mounted) {
+        return;
+    }
+
+    detach_filesystem(sdfs_prefix);
+    f_mount(NULL, sdfs_drive, 0);
+    sdfs_mounted = false;
+}
+
+static char mini_console_buf[MINI_CONSOLE_SIZE];
+
+static void mini_console_scroll(int *pos) {
+    memmove(mini_console_buf, mini_console_buf + MINI_CONSOLE_COLS,
+            MINI_CONSOLE_SIZE - MINI_CONSOLE_COLS);
+    *pos -= MINI_CONSOLE_COLS;
+}
+
+static void mini_console_put(int *pos, char ch) {
+    if (*pos >= (MINI_CONSOLE_COLS * MINI_CONSOLE_ROWS)) {
+        mini_console_scroll(pos);
+    }
+
+    mini_console_buf[(*pos)++] = ch;
+    mini_console_buf[*pos] = '\0';
+}
+
+static int mini_console_write(char *buf, unsigned int len) {
+    int pos = strlen(mini_console_buf);
+
+    for (unsigned int i = 0; i < len; i++) {
+        switch (buf[i]) {
+        case '\r':
+        case '\n':
+            if ((pos % MINI_CONSOLE_COLS) == 0) {
+                mini_console_put(&pos, ' ');
+            }
+            while ((pos % MINI_CONSOLE_COLS) != 0) {
+                mini_console_put(&pos, ' ');
+            }
+            break;
+        case '\t':
+            do {
+                mini_console_put(&pos, ' ');
+            } while ((pos % 4) != 0);
+            break;
+        default:
+            mini_console_put(&pos, buf[i]);
+            break;
+        }
+    }
+
+    return len;
+}
+
+static void mini_console_draw_char(surface_t *disp, int x, int y, char ch) {
+    if (x < 0 || y < 0 ||
+        x + TOM_THUMB_WIDTH > disp->width ||
+        y + TOM_THUMB_HEIGHT > disp->height) {
+        return;
+    }
+
+    const uint8_t *glyph = tom_thumb_get_glyph((uint8_t)ch);
+    for (int row = 0; row < TOM_THUMB_HEIGHT; row++) {
+        uint16_t *dst = (uint16_t *)((uint8_t *)disp->buffer + (y + row) * disp->stride) + x;
+        uint8_t bits = glyph[row];
+        for (int col = 0; col < TOM_THUMB_WIDTH; col++) {
+            if (bits & (1 << (TOM_THUMB_WIDTH - 1 - col))) {
+                dst[col] = MINI_CONSOLE_FG;
+            }
+        }
+    }
+}
+
+static const resolution_t CONSOLE_RESOLUTION = {
+    .width = CONSOLE_FRAMEBUFFER_WIDTH,
+    .height = CONSOLE_FRAMEBUFFER_HEIGHT,
+    .interlaced = false,
+};
+
+static void console_apply_vi_window(void) {
+    const uint32_t h_default = *VI_H_VIDEO_REG;
+    const uint32_t v_start = VI_VIDEO_START(*VI_V_VIDEO_REG);
+    const uint32_t h_start = VI_VIDEO_START(h_default);
+
+    *VI_X_SCALE_REG = VI_X_SCALE_CONSOLE;
+    *VI_Y_SCALE_REG = VI_Y_SCALE_CONSOLE;
+    *VI_CTRL_REG = (*VI_CTRL_REG & ~(VI_PIXEL_ADVANCE_MASK | VI_AA_MODE_MASK)) |
+                   VI_PIXEL_ADVANCE(0) |
+                   VI_AA_MODE_NONE;
+    *VI_H_VIDEO_REG = VI_VIDEO_SET(h_start + CONSOLE_H_OFFSET,
+                                   h_start + CONSOLE_H_OFFSET + CONSOLE_VI_OUTPUT_WIDTH);
+    *VI_V_VIDEO_REG = VI_VIDEO_SET(v_start + CONSOLE_V_OFFSET * 2,
+                                   v_start + (CONSOLE_V_OFFSET + CONSOLE_VI_OUTPUT_HEIGHT) * 2);
+}
+
+static void console_apply_vi_origin_offset(void) {
+    const uint32_t offset = CONSOLE_ORIGIN_WRAP_PIXELS * sizeof(uint16_t);
+    *VI_ORIGIN_REG = (*VI_ORIGIN_REG - offset) & 0x00FFFFFF;
+}
+
+void console_init(void) {
+    static stdio_t console_calls = {0, mini_console_write, 0};
+
+    register_VI_handler(console_apply_vi_origin_offset);
+    display_init(CONSOLE_RESOLUTION, DEPTH_16_BPP, 1, GAMMA_NONE, FILTERS_RESAMPLE);
+    console_apply_vi_window();
+    hook_stdio_calls(&console_calls);
+    console_clear();
+}
+
+void console_set_render_mode(int mode) {
+    (void)mode;
+}
+
+void console_clear(void) {
+    mini_console_buf[0] = '\0';
+}
+
+void console_render(void) {
+    surface_t *disp = display_get();
+    if (disp == NULL) {
+        return;
+    }
+
+    for (int y = 0; y < disp->height; y++) {
+        uint16_t *dst = (uint16_t *)((uint8_t *)disp->buffer + y * disp->stride);
+        for (int x = 0; x < disp->width; x++) {
+            dst[x] = MINI_CONSOLE_BG;
+        }
+    }
+
+    for (int y = 0; y < MINI_CONSOLE_ROWS; y++) {
+        for (int x = 0; x < MINI_CONSOLE_COLS; x++) {
+            char ch = mini_console_buf[y * MINI_CONSOLE_COLS + x];
+            if (ch == '\0') {
+                display_show(disp);
+                return;
+            }
+            mini_console_draw_char(disp,
+                                   MINI_CONSOLE_X + x * TOM_THUMB_CELL_WIDTH,
+                                   MINI_CONSOLE_Y + y * TOM_THUMB_CELL_HEIGHT,
+                                   ch);
+        }
+    }
+    display_show(disp);
+}
 
 static void print_loc(const char *text) {
     printf("%s", text);
@@ -592,14 +1090,41 @@ static void print_revision_suffix(uint8_t revision) {
     }
 }
 
+static void append_path_char(char *out, size_t out_size, size_t *pos, char ch) {
+    if (out_size == 0) {
+        return;
+    }
+
+    if (*pos + 1 < out_size) {
+        out[*pos] = ch;
+        (*pos)++;
+    }
+    out[*pos] = '\0';
+}
+
+static void append_path_text(char *out, size_t out_size, size_t *pos, const char *text) {
+    while (*text != '\0') {
+        append_path_char(out, out_size, pos, *text);
+        text++;
+    }
+}
+
 static void format_cart_file_path(char *out, size_t out_size, const cart_info_t *info,
                                   const char *dir, const char *ext) {
     const char suffix = revision_suffix(info->revision);
-    if (suffix != '\0') {
-        snprintf(out, out_size, "%s/%s%c.%s", dir, info->product, suffix, ext);
-    } else {
-        snprintf(out, out_size, "%s/%s.%s", dir, info->product, ext);
+    size_t pos = 0;
+    if (out_size != 0) {
+        out[0] = '\0';
     }
+
+    append_path_text(out, out_size, &pos, dir);
+    append_path_char(out, out_size, &pos, '/');
+    append_path_text(out, out_size, &pos, info->product);
+    if (suffix != '\0') {
+        append_path_char(out, out_size, &pos, suffix);
+    }
+    append_path_char(out, out_size, &pos, '.');
+    append_path_text(out, out_size, &pos, ext);
 }
 
 static void set_cart_paths(cart_info_t *info) {
@@ -1376,7 +1901,7 @@ static bool select_dump_mode(dump_mode_t *mode) {
     while (true) {
         print_header();
         printf(LOC.dump_mode_label, dump_mode_name((dump_mode_t)selected));
-        print_loc(LOC.prompt_left_right_mode);
+        print_loc(LOC.prompt_left_right_confirm);
         console_render();
 
         do {
@@ -1616,7 +2141,7 @@ static bool checksum_sd_file(const char *path, uint8_t *buf, size_t buf_size,
                              size_t size, uint32_t *out_crc) {
     const int fd = open(path, O_RDONLY);
     if (fd == -1) {
-        printf(LOC.fmt_failed_open, path, errno, strerror(errno));
+        printf(LOC.fmt_failed_open, path, errno);
         console_render();
         return false;
     }
@@ -1634,7 +2159,7 @@ static bool checksum_sd_file(const char *path, uint8_t *buf, size_t buf_size,
         const size_t len = checksum_read_len(buf_size, size - offset);
 
         if (!read_all(fd, buf, len)) {
-            printf(LOC.fmt_failed_read, path, errno, strerror(errno));
+            printf(LOC.fmt_failed_read, path, errno);
             console_render();
             close(fd);
             return false;
@@ -1656,7 +2181,7 @@ static bool checksum_sd_file(const char *path, uint8_t *buf, size_t buf_size,
     }
 
     if (close(fd) == -1) {
-        printf(LOC.fmt_failed_close, path, errno, strerror(errno));
+        printf(LOC.fmt_failed_close, path, errno);
         console_render();
         return false;
     }
@@ -1666,8 +2191,13 @@ static bool checksum_sd_file(const char *path, uint8_t *buf, size_t buf_size,
 }
 
 static bool file_exists(const char *path) {
-    struct stat st;
-    return stat(path, &st) == 0;
+    const int fd = open(path, O_RDONLY);
+    if (fd == -1) {
+        return false;
+    }
+
+    close(fd);
+    return true;
 }
 
 static const char *path_basename(const char *path) {
@@ -1782,7 +2312,8 @@ static bool confirm_restore_identity_warning(const restore_file_t *file,
         if (!same_revision) {
             print_loc(LOC.revision_differs);
         }
-        print_loc(LOC.prompt_restore_anyway_spaced);
+        print_loc(LOC.newline);
+        print_loc(LOC.prompt_restore_anyway);
         console_render();
         return wait_for_a_or_b();
     }
@@ -1795,15 +2326,9 @@ static bool confirm_restore_identity_warning(const restore_file_t *file,
     return false;
 }
 
-static bool restore_file_size(const char *path, int64_t dir_size, size_t *out_size) {
+static bool restore_file_size(int64_t dir_size, size_t *out_size) {
     if (dir_size > 0 && dir_size <= RESTORE_MAX_FILE_SIZE) {
         *out_size = (size_t)dir_size;
-        return true;
-    }
-
-    struct stat st;
-    if (stat(path, &st) == 0 && st.st_size > 0 && st.st_size <= RESTORE_MAX_FILE_SIZE) {
-        *out_size = (size_t)st.st_size;
         return true;
     }
 
@@ -1821,7 +2346,7 @@ static int load_restore_files_from_dir(restore_file_t *files, int max_files, con
             ascii_ends_with_casefold(dir.d_name, ".sav") &&
             copy_cstr_checked(files[count].name, sizeof(files[count].name), dir.d_name) &&
             format_restore_path(files[count].path, sizeof(files[count].path), dir_path, dir.d_name) &&
-            restore_file_size(files[count].path, dir.d_size, &file_size)) {
+            restore_file_size(dir.d_size, &file_size)) {
             files[count].size = file_size;
             count++;
         }
@@ -1865,7 +2390,7 @@ static bool select_restore_file(restore_file_t *files, int count,
         printf(LOC.dir_label, restore_dir);
         printf(LOC.plain_line, files[index].name);
         printf(LOC.bytes_line, (unsigned)files[index].size);
-        print_loc(LOC.prompt_left_right_file);
+        print_loc(LOC.prompt_left_right_confirm);
         console_render();
 
         do {
@@ -1900,21 +2425,21 @@ static bool select_restore_file(restore_file_t *files, int count,
 static uint8_t *load_restore_save_file(const restore_file_t *file) {
     uint8_t *buf = malloc(file->size);
     if (buf == NULL) {
-        printf(LOC.err_alloc_save, errno, strerror(errno));
+        printf(LOC.err_alloc_save, errno);
         console_render();
         return NULL;
     }
 
     const int fd = open(file->path, O_RDONLY);
     if (fd == -1) {
-        printf(LOC.fmt_failed_open, file->path, errno, strerror(errno));
+        printf(LOC.fmt_failed_open, file->path, errno);
         console_render();
         free(buf);
         return NULL;
     }
 
     if (!read_all(fd, buf, file->size)) {
-        printf(LOC.fmt_failed_read, file->path, errno, strerror(errno));
+        printf(LOC.fmt_failed_read, file->path, errno);
         console_render();
         close(fd);
         free(buf);
@@ -1944,7 +2469,7 @@ static int open_sd_output_file(const char *path, bool append, bool quiet) {
 
     const int fd = open(path, flags, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH);
     if (fd == -1 && !quiet) {
-        printf(LOC.fmt_failed_open, path, errno, strerror(errno));
+        printf(LOC.fmt_failed_open, path, errno);
         console_render();
     }
 
@@ -1959,21 +2484,21 @@ static bool write_sd_file_to_path(const char *path, const uint8_t *buf, size_t l
     }
 
     if (lseek(fd, offset, SEEK_SET) == -1) {
-        printf(LOC.fmt_failed_seek, path, errno, strerror(errno));
+        printf(LOC.fmt_failed_seek, path, errno);
         console_render();
         close(fd);
         return false;
     }
 
     if (!write_all(fd, buf, len)) {
-        printf(LOC.fmt_failed_write, path, errno, strerror(errno));
+        printf(LOC.fmt_failed_write, path, errno);
         console_render();
         close(fd);
         return false;
     }
 
     if (close(fd) == -1) {
-        printf(LOC.fmt_failed_close, path, errno, strerror(errno));
+        printf(LOC.fmt_failed_close, path, errno);
         console_render();
         return false;
     }
@@ -2306,7 +2831,7 @@ static bool write_compressed_pass_to_sd(const char *path, uint8_t *comp_buf,
     }
 
     if (lseek(fd, pass->raw_start, SEEK_SET) == -1) {
-        printf(LOC.fmt_failed_seek, path, errno, strerror(errno));
+        printf(LOC.fmt_failed_seek, path, errno);
         console_render();
         close(fd);
         return false;
@@ -2340,14 +2865,14 @@ static bool write_compressed_pass_to_sd(const char *path, uint8_t *comp_buf,
         }
 
         if (lseek(fd, tail_offset, SEEK_SET) == -1) {
-            printf(LOC.fmt_failed_seek, path, errno, strerror(errno));
+            printf(LOC.fmt_failed_seek, path, errno);
             console_render();
             close(fd);
             return false;
         }
 
         if (!write_all(fd, tail_bufs[i], pass->raw_tail_size[i])) {
-            printf(LOC.fmt_failed_write, path, errno, strerror(errno));
+            printf(LOC.fmt_failed_write, path, errno);
             console_render();
             close(fd);
             return false;
@@ -2357,7 +2882,7 @@ static bool write_compressed_pass_to_sd(const char *path, uint8_t *comp_buf,
     }
 
     if (raw_tail_total != 0 && lseek(fd, pass->raw_start, SEEK_SET) == -1) {
-        printf(LOC.fmt_failed_seek, path, errno, strerror(errno));
+        printf(LOC.fmt_failed_seek, path, errno);
         console_render();
         close(fd);
         return false;
@@ -2384,7 +2909,7 @@ static bool write_compressed_pass_to_sd(const char *path, uint8_t *comp_buf,
 
         if (raw) {
             if (!write_all(fd, comp_buf + in_pos, payload_size)) {
-                printf(LOC.fmt_failed_write, path, errno, strerror(errno));
+                printf(LOC.fmt_failed_write, path, errno);
                 console_render();
                 close(fd);
                 return false;
@@ -2398,7 +2923,7 @@ static bool write_compressed_pass_to_sd(const char *path, uint8_t *comp_buf,
             }
 
             if (!write_all(fd, scratch_buf, raw_size)) {
-                printf(LOC.fmt_failed_write, path, errno, strerror(errno));
+                printf(LOC.fmt_failed_write, path, errno);
                 console_render();
                 close(fd);
                 return false;
@@ -2417,7 +2942,7 @@ static bool write_compressed_pass_to_sd(const char *path, uint8_t *comp_buf,
     }
 
     if (close(fd) == -1) {
-        printf(LOC.fmt_failed_close, path, errno, strerror(errno));
+        printf(LOC.fmt_failed_close, path, errno);
         console_render();
         return false;
     }
@@ -2515,6 +3040,25 @@ static uint8_t *malloc_largest_rom_buffer(size_t *out_size, size_t mem_size) {
     return NULL;
 }
 
+static bool realloc_largest_rom_buffer(uint8_t **buf, size_t *size, size_t mem_size) {
+    const size_t old_size = *size;
+
+    free(*buf);
+    *buf = malloc_largest_rom_buffer(size, mem_size);
+    if (*buf != NULL) {
+        return true;
+    }
+
+    *buf = malloc(old_size);
+    if (*buf != NULL) {
+        *size = old_size;
+        return true;
+    }
+
+    *size = 0;
+    return false;
+}
+
 static void swap_reset_callback(void) {
 }
 
@@ -2540,12 +3084,12 @@ static void swap(const char *to, const char *action) {
 }
 
 static void prepare_flashcart_removal(void) {
-    debug_close_sdfs();
+    sdfs_unmount();
     cart_exit();
 }
 
 static void remount_sd(void) {
-    debug_close_sdfs();
+    sdfs_unmount();
 
     while (cart_init() < 0) {
         print_loc(LOC.prompt_flashcart_retry);
@@ -2559,9 +3103,8 @@ static void remount_sd(void) {
         wait_for_a_press();
     }
 
-    while (!debug_init_sdfs("sd:/", -1)) {
-        printf(LOC.prompt_mount_retry,
-               errno, strerror(errno));
+    while (!sdfs_mount("sd:/", -1)) {
+        printf(LOC.prompt_mount_retry, errno);
         console_render();
         wait_for_a_press();
     }
@@ -2596,7 +3139,7 @@ void dump_rom(void) {
 
     crc_buf = malloc(CART_CHECKSUM_IMAGE_SIZE);
     if (crc_buf == NULL) {
-        printf(LOC.err_alloc_crc, errno, strerror(errno));
+        printf(LOC.err_alloc_crc, errno);
         console_render();
         return;
     }
@@ -2617,8 +3160,7 @@ void dump_rom(void) {
         save_info = detect_save_info();
         save_buf = malloc(save_info.size);
         if (save_buf == NULL) {
-            printf(LOC.err_alloc_save,
-                   errno, strerror(errno));
+            printf(LOC.err_alloc_save, errno);
             console_render();
             ok = false;
             pause_after_error();
@@ -2643,8 +3185,7 @@ void dump_rom(void) {
         io_block_size = comp_settings.block_size;
         comp_buf = malloc_largest_rom_buffer(&chunk, mem_size);
         if (comp_buf == NULL) {
-            printf(LOC.err_alloc_rom,
-                   errno, strerror(errno));
+            printf(LOC.err_alloc_rom, errno);
             console_render();
             ok = false;
             pause_after_error();
@@ -2686,6 +3227,7 @@ void dump_rom(void) {
         }
 
         compressed_pass_t pass = {0};
+        bool save_freed_this_pass = false;
 
         if (!compress_cart_pass(comp_buf, chunk, &comp_settings, io_block_size,
                                 offset, cart.selected_size, &pass)) {
@@ -2736,6 +3278,7 @@ void dump_rom(void) {
             console_render();
             free(save_buf);
             save_buf = NULL;
+            save_freed_this_pass = true;
         }
 
         uint8_t *comp_tail_buf = NULL;
@@ -2770,6 +3313,22 @@ void dump_rom(void) {
                (unsigned)(pass.raw_start + pass.raw_size));
         console_render();
         offset += pass.raw_size;
+
+        if (save_freed_this_pass && offset < cart.selected_size) {
+            const size_t old_chunk = chunk;
+            if (!realloc_largest_rom_buffer(&comp_buf, &chunk, mem_size)) {
+                printf(LOC.err_alloc_rom, errno);
+                console_render();
+                ok = false;
+                pause_after_error();
+                break;
+            }
+            if (chunk > old_chunk) {
+                printf(LOC.rom_buffer, (unsigned)(chunk / 1024));
+                console_render();
+            }
+        }
+
         first_pass = false;
     }
 
@@ -2832,7 +3391,7 @@ void dump_to_accessory(void) {
 
     uint8_t *const crc_buf = malloc(CART_CHECKSUM_IMAGE_SIZE);
     if (crc_buf == NULL) {
-        printf(LOC.err_alloc_crc, errno, strerror(errno));
+        printf(LOC.err_alloc_crc, errno);
         console_render();
 
         return;
@@ -2864,6 +3423,13 @@ void dump_to_accessory(void) {
 void restore_save(void) {
     print_header();
 
+    while (!sdfs_mount("sd:/", -1)) {
+        printf(LOC.prompt_mount_retry, errno);
+        console_render();
+        wait_for_a_press();
+        print_header();
+    }
+
     restore_file_t files[MAX_RESTORE_FILES];
     int selected = 0;
     const char *restore_dir = NULL;
@@ -2892,7 +3458,7 @@ void restore_save(void) {
 
     uint8_t *verify_buf = malloc(SAVE_FLASH_SIZE);
     if (verify_buf == NULL) {
-        printf(LOC.err_alloc_verify, errno, strerror(errno));
+        printf(LOC.err_alloc_verify, errno);
         console_render();
         free(save_buf);
         pause_after_error();
@@ -2901,7 +3467,7 @@ void restore_save(void) {
 
     uint8_t *crc_buf = malloc(CART_CHECKSUM_IMAGE_SIZE);
     if (crc_buf == NULL) {
-        printf(LOC.err_alloc_crc, errno, strerror(errno));
+        printf(LOC.err_alloc_crc, errno);
         console_render();
         free(verify_buf);
         free(save_buf);
@@ -2961,7 +3527,7 @@ void restore_save(void) {
         printf(LOC.restore_to_title, cart.title);
         print_revision_suffix(cart.revision);
         print_loc(LOC.restore_confirm_body);
-        print_loc(LOC.prompt_restore_cancel);
+        print_loc(LOC.prompt_restore_anyway);
         console_render();
 
         if (!wait_for_a_or_b()) {
@@ -3011,7 +3577,7 @@ void clear_cart_save(void) {
 
     uint8_t *crc_buf = malloc(CART_CHECKSUM_IMAGE_SIZE);
     if (crc_buf == NULL) {
-        printf(LOC.err_alloc_crc, errno, strerror(errno));
+        printf(LOC.err_alloc_crc, errno);
         console_render();
         pause_after_error();
         return;
@@ -3044,7 +3610,7 @@ void clear_cart_save(void) {
         printf(LOC.region_label, printable_header_char(cart.region));
         printf(LOC.cart_save_bytes, save_info.name, (unsigned)save_info.size);
         print_loc(LOC.clear_warning);
-        print_loc(LOC.prompt_clear_first);
+        print_loc(LOC.prompt_continue_cancel);
         console_render();
 
         if (!wait_for_a_or_b()) {
@@ -3068,7 +3634,7 @@ void clear_cart_save(void) {
         save_buf = malloc(save_info.size);
         verify_buf = malloc(save_info.size);
         if (save_buf == NULL || verify_buf == NULL) {
-            printf(LOC.err_alloc_save, errno, strerror(errno));
+            printf(LOC.err_alloc_save, errno);
             console_render();
             ok = false;
             pause_after_error();
@@ -3129,8 +3695,6 @@ int main(void) {
     }
 
     joypad_init();
-    dfs_init(DFS_DEFAULT_LOCATION);
-    debug_init_sdfs("sd:/", -1);
 
     while (true) {
         print_header();
