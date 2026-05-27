@@ -2,22 +2,32 @@
 #include <libdragon.h>
 
 #include <dir.h>
-#include <eeprom.h>
-#include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <malloc.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <system.h>
-#include <fatfs/ff.h>
-#include <fatfs/diskio.h>
 
 #include "accessory.h"
 #include "pif.h"
 #include "tom_thumb_font.h"
+
+#ifdef debug_init_sdfs
+#undef debug_init_sdfs
+#endif
+#ifdef debug_close_sdfs
+#undef debug_close_sdfs
+#endif
+extern bool debug_init_sdfs(const char *prefix, int npart);
+extern void debug_close_sdfs(void);
+static int shark_errno = 0;
+#define errno shark_errno
+#define EBUSY 16
 
 #define printf iprintf
 
@@ -54,17 +64,17 @@
 #define COMP_SPECULATIVE_MIN_REMAINING 0x10000
 #define CRC32_POLY 0xEDB88320u
 #define CHECKSUM_READ_SIZE 0x100000
-#define CONSOLE_FRAMEBUFFER_WIDTH 120
-#define CONSOLE_FRAMEBUFFER_HEIGHT 48
-#define CONSOLE_H_OFFSET 128
-#define CONSOLE_V_OFFSET 9
+#define CONSOLE_FRAMEBUFFER_WIDTH 96
+#define CONSOLE_FRAMEBUFFER_HEIGHT 40
+#define CONSOLE_H_OFFSET 96
+#define CONSOLE_V_OFFSET 32
 #define CONSOLE_H_STRETCH_PERCENT 400
 #define CONSOLE_V_STRETCH_PERCENT 200
-#define CONSOLE_PROGRESS_BAR_WIDTH 8
+#define CONSOLE_PROGRESS_BAR_WIDTH 12
 #define CONSOLE_ORIGIN_WRAP_PIXELS 4
 #define PROGRESS_BAR_WIDTH CONSOLE_PROGRESS_BAR_WIDTH
-#define ROM_BUFFER_ALIGN 0x1000
-#define ROM_BUFFER_HEAP_RESERVE 0x10000
+#define ROM_BUFFER_ALIGN (1*1024)
+#define ROM_BUFFER_HEAP_RESERVE (1*1024)
 #define RAW_TAIL_BUFFER_COUNT 3
 #define ARRAY_COUNT(arr) (sizeof(arr) / sizeof((arr)[0]))
 #define MINI_CONSOLE_COLS (CONSOLE_FRAMEBUFFER_WIDTH / TOM_THUMB_CELL_WIDTH)
@@ -110,36 +120,62 @@
 #define SAVE_FLASH_SIZE 0x20000
 #define SAVE_EEPROM_4K_SIZE 0x200
 #define SAVE_EEPROM_16K_SIZE 0x800
+#define JOYBUS_COMMAND_ID_STATUS 0x00
+#define JOYBUS_COMMAND_ID_EEPROM_READ_BLOCK 0x04
+#define JOYBUS_COMMAND_ID_EEPROM_WRITE_BLOCK 0x05
+#define JOYBUS_EEPROM_TYPE 0x8000
+#define JOYBUS_EEPROM_16K_TYPE 0x4000
+#define JOYBUS_EEPROM_BUSY 0x80
+#define JOYBUS_EEPROM_STATUS_TIMEOUT_MS 250
 #define CART_DOM2_ADDR2_START 0x08000000
 #define FLASHRAM_IDENTIFIER 0x11118001
 #define FLASHRAM_OFFSET_COMMAND 0x00010000
 #define FLASHRAM_PAGE_SIZE 0x80
 #define FLASHRAM_SECTOR_SIZE 0x4000
 #define FLASHRAM_PAGES_PER_SECTOR (FLASHRAM_SECTOR_SIZE / FLASHRAM_PAGE_SIZE)
-#define FLASHRAM_STATUS_PROGRAM_BUSY 0x01
-#define FLASHRAM_STATUS_ERASE_BUSY 0x02
-#define FLASHRAM_STATUS_PROGRAM_OK 0x04
-#define FLASHRAM_STATUS_ERASE_OK 0x08
+#define FLASHRAM_SECTOR_COUNT (SAVE_FLASH_SIZE / FLASHRAM_SECTOR_SIZE)
 #define FLASHRAM_COMMAND_CHIP_ERASE_MODE 0x3C000000
-#define FLASHRAM_COMMAND_SECTOR_ERASE_MODE 0x4B000000
+#define FLASHRAM_COMMAND_SET_ERASE_OFFSET 0x4B000000
 #define FLASHRAM_COMMAND_EXECUTE_ERASE 0x78000000
-#define FLASHRAM_COMMAND_EXECUTE_PROGRAM 0xA5000000
+#define FLASHRAM_COMMAND_PROGRAM_PAGE 0xA5000000
 #define FLASHRAM_COMMAND_PAGE_PROGRAM_MODE 0xB4000000
 #define FLASHRAM_COMMAND_STATUS_MODE 0xD2000000
 #define FLASHRAM_COMMAND_SET_IDENTIFY_MODE 0xE1000000
 #define FLASHRAM_COMMAND_SET_READ_MODE 0xF0000000
+#define FLASHRAM_STATUS_PROGRAM_BUSY 0x01
+#define FLASHRAM_STATUS_ERASE_BUSY 0x02
+#define FLASHRAM_STATUS_PROGRAM_OK 0x04
+#define FLASHRAM_STATUS_ERASE_OK 0x08
+#define FLASHRAM_VERSION_OLD 0
+#define FLASHRAM_VERSION_NEW 1
+#define FLASHRAM_VENDOR_MX_PROTO_A 0x00C20000u
+#define FLASHRAM_VENDOR_MX_A 0x00C20001u
+#define FLASHRAM_VENDOR_MX_C 0x00C2001Eu
+#define FLASHRAM_VENDOR_MX_B_AND_D 0x00C2001Du
+#define FLASHRAM_VENDOR_MEI 0x003200F1u
+#define FLASHRAM_PROGRAM_DELAY_MS 20
+#define FLASHRAM_ERASE_DELAY_MS 500
 #define ROM_DUMP_DIR "sd:/dump"
-#define SAVE_DUMP_DIR "sd:/saves"
-#define RESTORE_DIR "sd:/restore"
+#define SAVE_DUMP_DIR "sd:/dump/saves"
+#define RESTORE_DIR "sd:/dump/saves"
 #define MAX_RESTORE_FILES 32
+#define MAX_PART_FILES 16
 #define RESTORE_NAME_LEN 32
 #define RESTORE_PATH_LEN 64
 #define RESTORE_MAX_FILE_SIZE 0x80000
+#define PART_NAME_LEN 40
+#define PART_PATH_LEN 64
+#define PART_META_MAGIC 0x53445054u
+#define PART_META_VERSION 1u
 
 joypad_inputs_t inputs = {0}, prev_inputs;
 #define INPUT(inp) ((inputs.inp) && !(prev_inputs.inp))
 
 static bool pif_hung = false;
+static int flashram_driver_version = FLASHRAM_VERSION_NEW;
+static uint32_t flashram_driver_type_id = 0;
+static uint32_t flashram_driver_vendor_id = 0;
+static bool flashram_driver_initialized = false;
 
 typedef enum {
     CART_CRC_KIND_6102,
@@ -180,8 +216,8 @@ typedef struct {
     char title[CART_TITLE_LENGTH + 1];
     char product[CART_PRODUCT_LENGTH + 1];
     uint8_t revision;
-    char rom_path[32];
-    char save_path[32];
+    char rom_path[64];
+    char save_path[64];
     uint8_t region;
     size_t detected_size;
     size_t selected_size;
@@ -192,6 +228,39 @@ typedef struct {
     const char *name;
     size_t size;
 } save_info_t;
+
+typedef struct __attribute__((packed)) {
+    struct __attribute__((packed)) {
+        uint8_t command;
+        uint8_t block;
+    } send;
+    struct __attribute__((packed)) {
+        uint8_t data[EEPROM_BLOCK_SIZE];
+        uint8_t status;
+    } recv;
+} eeprom_read_block_cmd_t;
+
+typedef struct __attribute__((packed)) {
+    struct __attribute__((packed)) {
+        uint8_t command;
+        uint8_t block;
+        uint8_t data[EEPROM_BLOCK_SIZE];
+    } send;
+    struct __attribute__((packed)) {
+        uint8_t status;
+    } recv;
+} eeprom_write_block_cmd_t;
+
+typedef struct __attribute__((packed)) {
+    struct __attribute__((packed)) {
+        uint8_t command;
+    } send;
+    struct __attribute__((packed)) {
+        uint8_t type_lo;
+        uint8_t type_hi;
+        uint8_t status;
+    } recv;
+} eeprom_status_cmd_t;
 
 typedef struct {
     size_t raw_start;
@@ -242,6 +311,25 @@ typedef struct {
 } restore_file_t;
 
 typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    char product[CART_PRODUCT_LENGTH + 1];
+    uint8_t revision;
+    uint8_t reserved[3];
+    uint32_t rom_size;
+    uint32_t offset;
+    uint32_t cart_crc32;
+} dump_part_meta_t;
+
+typedef struct {
+    char name[PART_NAME_LEN];
+    char path[PART_PATH_LEN];
+    dump_part_meta_t meta;
+    bool meta_valid;
+} part_file_t;
+
+typedef struct {
+    const char *generic_error;
     const char *app_header;
     const char *newline;
     const char *revision_suffix_fmt;
@@ -250,6 +338,7 @@ typedef struct {
     const char *prompt_restore_anyway;
     const char *prompt_overwrite_cancel;
     const char *prompt_continue_cancel;
+    const char *prompt_resume_dump;
     const char *prompt_retry_reinsert;
     const char *prompt_reset_now;
     const char *prompt_swap;
@@ -371,61 +460,67 @@ typedef struct {
     const char *clearing_save;
     const char *clear_verify_failed;
     const char *clear_success;
+    const char *resume_title;
+    const char *resume_offset;
 } loc_t;
 
+static const char LOC_GENERIC_ERROR[] = "Err\n";
+
 static const loc_t LOC = {
-    .app_header = "N64 SwapDumper\n",
+    .generic_error = LOC_GENERIC_ERROR,
+    .app_header = "N64 SwapDumper v0.3\n",
     .newline = "\n",
     .revision_suffix_fmt = " (%c)",
     .press_a_continue = "A: OK\n",
-    .prompt_left_right_confirm = "Left/Right: change  A: OK  B: back\n",
-    .prompt_restore_anyway = "A: restore  B: back\n",
-    .prompt_overwrite_cancel = "A: overwrite  B: back\n",
-    .prompt_continue_cancel = "A: OK  B: back\n",
+    .prompt_left_right_confirm = "Dpad:Change A:OK B:Back\n",
+    .prompt_restore_anyway = "A:Restore - B:Back\n",
+    .prompt_overwrite_cancel = "A:Overwrite - B:Back\n",
+    .prompt_continue_cancel = "A:OK - B:Back\n",
+    .prompt_resume_dump = "A:Resume - B:Start Over\n",
     .prompt_retry_reinsert = "Reinsert cart+press A\n",
     .prompt_reset_now = "Press RESET now\n",
-    .prompt_swap = "Swap to %s then A to %s\n",
+    .prompt_swap = "Swap- then press A\n",
     .prompt_flashcart_retry = "Flashcart init failed\nA: retry\n",
     .prompt_sd_retry = "SD init failed\nA: retry\n",
-    .prompt_mount_retry = "SD mount failed (%d)\nA: retry\n",
-    .err_crc_scratch_small = "CRC buf too small\n",
+    .prompt_mount_retry = "SD mount failed e%d f%d\nA: retry\n",
+    .err_crc_scratch_small = LOC_GENERIC_ERROR,
     .err_need_got = "Need %06X, got %06X\n",
     .err_invalid_header = "Bad header: %02X %02X %02X %02X\n",
     .checking_cart_crc = "Checking CRC...\n",
     .crc_ok = "CRC OK (%s)\n",
-    .err_header_changed = "Header changed\n",
-    .err_crc_failed = "CRC failed\n",
-    .crc_expected = "Want: %08" PRIX32 " %08" PRIX32 "\n",
-    .crc_read_as = "Got:  %08" PRIX32 " %08" PRIX32 " (%s)\n",
-    .err_different_cart = "Wrong cart\n",
-    .detecting_rom_size = "Detecting size...\n",
-    .err_size_scratch_small = "Size buf too small\n",
-    .detected_rom_size = "Detected: %u MiB\n",
-    .title_label = "Title: %s",
-    .product_label = "Product: %s",
-    .rev_label = "  Rev: %c",
-    .region_label = "  Region: %c\n",
-    .crc_label = "CRC: %08" PRIX32 " %08" PRIX32 "\n",
-    .rom_file_label = "File: %s\n",
-    .rom_size_label = "Size: %u MiB",
-    .detected_suffix = " (detected)",
-    .dump_mode_label = "Mode: %s\n",
+    .err_header_changed = LOC_GENERIC_ERROR,
+    .err_crc_failed = "CRC err\n",
+    .crc_expected = "W:%08"PRIX32"%08"PRIX32"\n",
+    .crc_read_as = "G:%08"PRIX32"%08"PRIX32"(%s)\n",
+    .err_different_cart = LOC_GENERIC_ERROR,
+    .detecting_rom_size = "Detect...\n",
+    .err_size_scratch_small = LOC_GENERIC_ERROR,
+    .detected_rom_size = "Detected:%uMB\n",
+    .title_label = "%s",
+    .product_label = "Prod:%s",
+    .rev_label = "(%c)",
+    .region_label = "\n",
+    .crc_label = "CRC:%08" PRIX32 " %08" PRIX32 "\n",
+    .rom_file_label = "Save as:%s\n",
+    .rom_size_label = "Size:%uMB",
+    .detected_suffix = "(auto)",
+    .dump_mode_label = "Dump:%s\n",
     .mode_rom_only = "ROM",
     .mode_save_only = "Save",
     .mode_rom_save = "Both",
-    .flash_restore_unsupported = "Flash write failed\n",
+    .flash_restore_unsupported = LOC_GENERIC_ERROR,
     .flash_erasing = "Erase Flash %u/%u\n",
     .flash_programming = "Write Flash %u/%u\n",
-    .flash_wait_timeout = "Flash timeout\n",
-    .flash_status_failed = "Flash status: %08" PRIX32 "\n",
+    .flash_wait_timeout = LOC_GENERIC_ERROR,
+    .flash_status_failed = LOC_GENERIC_ERROR,
     .cart_crc32_title = "Cart CRC32\n",
     .cart_crc32_subtitle = "\n",
     .sd_crc32_title = "Verify ROM...\n",
-    .fmt_failed_open = "Open failed: %s (%d)\n",
-    .fmt_failed_read = "Read failed: %s (%d)\n",
-    .fmt_failed_seek = "Seek failed: %s (%d)\n",
-    .fmt_failed_write = "Write failed: %s (%d)\n",
-    .fmt_failed_close = "Close failed: %s (%d)\n",
+    .fmt_failed_open = LOC_GENERIC_ERROR,
+    .fmt_failed_read = LOC_GENERIC_ERROR,
+    .fmt_failed_seek = LOC_GENERIC_ERROR,
+    .fmt_failed_write = LOC_GENERIC_ERROR,
+    .fmt_failed_close = LOC_GENERIC_ERROR,
     .restore_name_unrecognized = "Unknown save name\n\n",
     .expected_like = "Expected: %s\n",
     .restore_identity_warning = "Save may differ\n\n",
@@ -435,51 +530,51 @@ static const loc_t LOC = {
     .cart_label = "Cart: %s\n",
     .region_differs = "Region differs\n",
     .revision_differs = "Revision differs\n",
-    .restore_does_not_match = "Save does not match\n\n",
+    .restore_does_not_match = "Wrong save\n\n",
     .restore_save_title = "Restore\n\n",
     .dir_label = "Dir: %s\n",
     .bytes_line = "%u bytes\n\n",
-    .err_alloc_save = "Save alloc failed (%d)\n",
+    .err_alloc_save = LOC_GENERIC_ERROR,
     .save_exists = "Overwrite?\n%s\n\n",
     .progress_title_line = "%s",
-    .progress_size = "%u MB\n",
-    .progress_read = "Read: (",
-    .progress_bar_end = ") %u/%u MB\n",
-    .mib_progress = "%u/%u MB\n",
-    .progress_speed = "%u KB/s\n",
-    .progress_write = "Write: (",
-    .err_decompress_chunk = "Decompress failed\n",
+    .progress_size = "%u MB",
+    .progress_read = "R:(",
+    .progress_bar_end = ")%u/%uMB\n",
+    .mib_progress = "%u/%uMB\n",
+    .progress_speed = "",
+    .progress_write = "W:(",
+    .err_decompress_chunk = LOC_GENERIC_ERROR,
     .save_write_cancelled = "Save cancelled\n",
-    .err_alloc_crc = "CRC alloc failed (%d)\n",
-    .err_alloc_compressor = "Comp alloc failed (%d)\n",
-    .err_alloc_rom = "ROM alloc failed (%d)\n",
+    .err_alloc_crc = LOC_GENERIC_ERROR,
+    .err_alloc_compressor = LOC_GENERIC_ERROR,
+    .err_alloc_rom = LOC_GENERIC_ERROR,
     .reading_save = "Read save %s, %u B\n",
     .err_read_save_data = "Save read failed\n",
-    .rom_buffer = "Buf: %u KB\n",
+    .rom_buffer = "",
     .compression_label = "Comp: ",
     .compression_blocks_short = "%u KB blocks\n",
     .cart_crc32_result = "CRC32: %08" PRIX32 "\n",
     .chunk_cancelled = "Chunk cancelled\n\n",
-    .err_compress_pass = "Compress failed\n",
-    .buffered_range = "Buf %06X-%06X\n",
-    .compressed_summary = "%u KB -> %u KB",
-    .raw_tail_summary = " + %u KB raw",
+    .err_compress_pass = LOC_GENERIC_ERROR,
+    .buffered_range = "",
+    .compressed_summary = "%uKB->%uKB",
+    .raw_tail_summary = "+%uKB raw",
     .wrote_save = "Wrote %s\n",
     .wrote_chunk = "Wrote %06X-%06X\n",
-    .full_rom_crc32 = "Full CRC32\n",
+    .full_rom_crc32 = "Checksum...\n",
     .checksum_status = "%s\n",
     .cart_crc_line = "Cart: %08" PRIX32 "\n",
     .sd_crc_line = "SD:   %08" PRIX32 "\n",
     .checksum_matches = "Verified!\n",
-    .checksum_mismatch = "BAD DUMP - CRC MISMATCH\n",
+    .checksum_mismatch = "BAD DUMP\n",
     .success = "Done!\n",
-    .err_no_accessory = "No accessory found\n",
-    .accessory_found = "Accessory: port %d\n",
-    .streaming_accessory = "Streaming to port %d...\n",
+    .err_no_accessory = LOC_GENERIC_ERROR,
+    .accessory_found = "",
+    .streaming_accessory = "",
     .verifying = "Verify...\n",
     .no_sav_files = "No .sav files found\n\n",
     .last_tried = "Last tried: %s\n",
-    .err_alloc_verify = "Verify alloc failed (%d)\n",
+    .err_alloc_verify = LOC_GENERIC_ERROR,
     .save_too_small = "Save too small\n",
     .save_too_large = "Save too large\n",
     .file_bytes = "File: %u bytes\n",
@@ -491,32 +586,28 @@ static const loc_t LOC = {
     .writing_save = "Write save %s\n",
     .restore_verify_failed = "Restore verify failed\n",
     .restore_success = "Save restored\n",
-    .err_ique = "iQue unsupported\n",
-    .main_dump_sd = "A: Dump to SD\n",
-    .main_dump_accessory = "B: Dump to accessory\n",
-    .main_restore = "C-Up: Restore save\n",
-    .main_clear_save = "Z+Down: Clear save\n",
+    .err_ique = LOC_GENERIC_ERROR,
+    .main_dump_sd =         "A:      Dump to SD\n",
+    .main_dump_accessory =  "B:      Dump to accessory\n",
+    .main_restore =         "C-Up:   Restore save\n",
+    .main_clear_save =      "Z+Down: Clear save\n",
     .clear_title = "Clear save\n",
-    .clear_warning = "This erases cart save.\n",
+    .clear_warning = "Save will be erased.\n",
     .clear_second_warning = "Last chance.\n",
-    .prompt_clear_second = "L+R+Z+Start: erase  B: back\n",
+    .prompt_clear_second = "L+Z+Start: erase  B: back\n",
     .clearing_save = "Clear save %s, %u B\n",
     .clear_verify_failed = "Clear verify failed\n",
-    .clear_success = "Save cleared\n",
+    .clear_success = "Save cleared\nWhat have you done?\n",
+    .resume_title = "Incomplete dump found\n",
+    .resume_offset = "Resume at %u/%u MB\n",
 };
 
 static dump_progress_t dprog;
 static bool dump_abort_requested = false;
 
-static FATFS sd_fat;
 static char sdfs_prefix[] = "sd:/";
-static char sdfs_drive[3] = "";
 static bool sdfs_mounted = false;
-#define FAT_VOLUME_SD 0
-#define MAX_FAT_FILES 2
-
-static FIL fat_files[MAX_FAT_FILES];
-static DIR find_dir;
+static int sdfs_last_mount_result = 0;
 
 __attribute__((weak, noreturn))
 void debug_assert_func_f(const char *file, int line, const char *func,
@@ -584,245 +675,22 @@ const char *__mips_fpreg[32] = {
     "$f24", "$f25", "$f26", "$f27", "$f28", "$f29", "$f30", "$f31",
 };
 
-__attribute__((weak))
-DSTATUS disk_initialize(BYTE pdrv) {
-    if (pdrv != FAT_VOLUME_SD) {
-        return STA_NOINIT;
-    }
-    return cart_card_init() ? STA_NOINIT : 0;
-}
-
-__attribute__((weak))
-DSTATUS disk_status(BYTE pdrv) {
-    return (pdrv == FAT_VOLUME_SD) ? 0 : STA_NOINIT;
-}
-
-__attribute__((weak))
-DRESULT disk_read(BYTE pdrv, BYTE *buff, LBA_t sector, UINT count) {
-    if (pdrv != FAT_VOLUME_SD) {
-        return RES_PARERR;
-    }
-    return cart_card_rd_dram(buff, sector, count) ? RES_ERROR : RES_OK;
-}
-
-__attribute__((weak))
-DRESULT disk_write(BYTE pdrv, const BYTE *buff, LBA_t sector, UINT count) {
-    if (pdrv != FAT_VOLUME_SD) {
-        return RES_PARERR;
-    }
-    return cart_card_wr_dram(buff, sector, count) ? RES_ERROR : RES_OK;
-}
-
-__attribute__((weak))
-DRESULT disk_ioctl(BYTE pdrv, BYTE cmd, void *buff) {
-    (void)buff;
-    if (pdrv != FAT_VOLUME_SD) {
-        return RES_PARERR;
-    }
-    return (cmd == CTRL_SYNC) ? RES_OK : RES_PARERR;
-}
-
-__attribute__((weak))
-DWORD get_fattime(void) {
-    return (DWORD)((2026 - 1980) << 25 | 1 << 21 | 1 << 16);
-}
-
-static void fat_set_errno(FRESULT err) {
-    switch (err) {
-    case FR_OK: return;
-    case FR_DISK_ERR: errno = EIO; return;
-    case FR_NOT_READY: errno = EBUSY; return;
-    case FR_NO_FILE:
-    case FR_NO_PATH: errno = ENOENT; return;
-    case FR_INVALID_NAME:
-    case FR_INVALID_OBJECT:
-    case FR_INVALID_PARAMETER: errno = EINVAL; return;
-    case FR_DENIED: errno = EACCES; return;
-    case FR_EXIST: errno = EEXIST; return;
-    case FR_WRITE_PROTECTED: errno = EROFS; return;
-    case FR_INVALID_DRIVE:
-    case FR_NOT_ENABLED:
-    case FR_NO_FILESYSTEM: errno = ENODEV; return;
-    case FR_TIMEOUT: errno = ETIMEDOUT; return;
-    case FR_LOCKED: errno = EBUSY; return;
-    case FR_NOT_ENOUGH_CORE: errno = ENOMEM; return;
-    case FR_TOO_MANY_OPEN_FILES: errno = EMFILE; return;
-    default: errno = EIO; return;
-    }
-}
-
-static void *fat_open(char *name, int flags) {
-    int slot = 0;
-    while (slot < MAX_FAT_FILES && fat_files[slot].obj.fs != NULL) {
-        slot++;
-    }
-    if (slot == MAX_FAT_FILES) {
-        errno = EMFILE;
-        return NULL;
-    }
-
-    int fat_flags = 0;
-    if ((flags & O_ACCMODE) == O_RDONLY) {
-        fat_flags |= FA_READ;
-    }
-    if ((flags & O_ACCMODE) == O_WRONLY) {
-        fat_flags |= FA_WRITE;
-    }
-    if ((flags & O_ACCMODE) == O_RDWR) {
-        fat_flags |= FA_READ | FA_WRITE;
-    }
-    if ((flags & O_APPEND) == O_APPEND) {
-        fat_flags |= FA_OPEN_APPEND;
-    }
-    if ((flags & O_TRUNC) == O_TRUNC) {
-        fat_flags |= FA_CREATE_ALWAYS;
-    }
-    if ((flags & O_CREAT) == O_CREAT) {
-        fat_flags |= ((flags & O_EXCL) == O_EXCL) ? FA_CREATE_NEW : FA_OPEN_ALWAYS;
-    } else {
-        fat_flags |= FA_OPEN_EXISTING;
-    }
-
-    FRESULT res = f_open(&fat_files[slot], name, fat_flags);
-    if (res != FR_OK) {
-        fat_set_errno(res);
-        fat_files[slot].obj.fs = NULL;
-        return NULL;
-    }
-
-    return &fat_files[slot];
-}
-
-static int fat_read(void *file, uint8_t *ptr, int len) {
-    UINT read = 0;
-    FRESULT res = f_read(file, ptr, len, &read);
-    if (res != FR_OK) {
-        fat_set_errno(res);
-        return -1;
-    }
-    return (int)read;
-}
-
-static int fat_write(void *file, uint8_t *ptr, int len) {
-    UINT written = 0;
-    FRESULT res = f_write(file, ptr, len, &written);
-    if (res != FR_OK) {
-        fat_set_errno(res);
-        return -1;
-    }
-    return (int)written;
-}
-
-static int fat_close(void *file) {
-    FRESULT res = f_close(file);
-    if (res != FR_OK) {
-        fat_set_errno(res);
-        return -1;
-    }
-    return 0;
-}
-
-static int fat_lseek(void *file, int offset, int whence) {
-    FIL *f = file;
-    FSIZE_t dest = 0;
-    switch (whence) {
-    case SEEK_SET: dest = (FSIZE_t)offset; break;
-    case SEEK_CUR: dest = f_tell(f) + offset; break;
-    case SEEK_END: dest = f_size(f) + offset; break;
-    default: errno = EINVAL; return -1;
-    }
-
-    FRESULT res = f_lseek(f, dest);
-    if (res != FR_OK) {
-        fat_set_errno(res);
-        return -1;
-    }
-    return (int)f_tell(f);
-}
-
-static int fat_unlink(char *name) {
-    FRESULT res = f_unlink(name);
-    if (res != FR_OK) {
-        fat_set_errno(res);
-        return -1;
-    }
-    return 0;
-}
-
-static int fat_findnext_common(dir_t *dir) {
-    FILINFO info;
-    FRESULT res = f_readdir(&find_dir, &info);
-    if (res != FR_OK) {
-        fat_set_errno(res);
-        return -1;
-    }
-    if (info.fname[0] == '\0') {
-        f_closedir(&find_dir);
-        return -1;
-    }
-
-    strncpy(dir->d_name, info.fname, sizeof(dir->d_name) - 1);
-    dir->d_name[sizeof(dir->d_name) - 1] = '\0';
-    dir->d_type = (info.fattrib & AM_DIR) ? DT_DIR : DT_REG;
-    dir->d_size = (int64_t)info.fsize;
-    return 0;
-}
-
-static int fat_findfirst(char *name, dir_t *dir) {
-    FRESULT res = f_opendir(&find_dir, name);
-    if (res != FR_OK) {
-        fat_set_errno(res);
-        return -1;
-    }
-    return fat_findnext_common(dir);
-}
-
-static int fat_findnext2(const char *path, dir_t *dir) {
-    (void)path;
-    return fat_findnext_common(dir);
-}
-
-static filesystem_t fat_fs = {
-    .open = fat_open,
-    .lseek = fat_lseek,
-    .read = fat_read,
-    .write = fat_write,
-    .close = fat_close,
-    .unlink = fat_unlink,
-    .findfirst = fat_findfirst,
-    .findnext2 = fat_findnext2,
-};
-
 static bool sdfs_mount(const char *prefix, int npart) {
+    errno = 0;
+    sdfs_last_mount_result = 0;
+
     if (sdfs_mounted) {
         return true;
     }
 
-    if (cart_init() < 0) {
-        return false;
-    }
-
-    if (cart_card_init() < 0) {
-        return false;
-    }
-
-    if (npart >= 0) {
-        sdfs_drive[0] = (char)('0' + npart);
-        sdfs_drive[1] = ':';
-        sdfs_drive[2] = '\0';
-    } else {
-        sdfs_drive[0] = '\0';
-    }
-
-    FRESULT res = f_mount(&sd_fat, sdfs_drive, 1);
-    if (res != FR_OK) {
-        fat_set_errno(res);
+    if (!debug_init_sdfs(prefix, npart)) {
+        errno = EBUSY;
+        sdfs_last_mount_result = 3; /* FR_NOT_READY */
         return false;
     }
 
     strncpy(sdfs_prefix, prefix, sizeof(sdfs_prefix) - 1);
     sdfs_prefix[sizeof(sdfs_prefix) - 1] = '\0';
-    attach_filesystem(sdfs_prefix, &fat_fs);
     sdfs_mounted = true;
     return true;
 }
@@ -832,8 +700,7 @@ static void sdfs_unmount(void) {
         return;
     }
 
-    detach_filesystem(sdfs_prefix);
-    f_mount(NULL, sdfs_drive, 0);
+    debug_close_sdfs();
     sdfs_mounted = false;
 }
 
@@ -928,25 +795,28 @@ static void console_apply_vi_origin_offset(void) {
     *VI_ORIGIN_REG = (*VI_ORIGIN_REG - offset) & 0x00FFFFFF;
 }
 
-void console_init(void) {
+void shark_console_clear(void);
+void shark_console_render(void);
+
+void shark_console_init(void) {
     static stdio_t console_calls = {0, mini_console_write, 0};
 
     register_VI_handler(console_apply_vi_origin_offset);
     display_init(CONSOLE_RESOLUTION, DEPTH_16_BPP, 1, GAMMA_NONE, FILTERS_RESAMPLE);
     console_apply_vi_window();
     hook_stdio_calls(&console_calls);
-    console_clear();
+    shark_console_clear();
 }
 
-void console_set_render_mode(int mode) {
+void shark_console_set_render_mode(int mode) {
     (void)mode;
 }
 
-void console_clear(void) {
+void shark_console_clear(void) {
     mini_console_buf[0] = '\0';
 }
 
-void console_render(void) {
+void shark_console_render(void) {
     surface_t *disp = display_get();
     if (disp == NULL) {
         return;
@@ -980,6 +850,18 @@ static void print_loc(const char *text) {
 }
 
 static void print_header(void);
+static void print_hex_bytes(const char *label, const uint8_t *buf, size_t len);
+static bool flashram_clear_data(void);
+static bool eeprom_read_data_raw(uint8_t *save_buf, size_t len);
+static bool read_save_data(uint8_t *save_buf, const save_info_t *save_info);
+static eeprom_type_t eeprom_present_raw(void);
+static bool read_part_meta(const char *path, dump_part_meta_t *meta);
+static bool flashram_os_read_array(uint8_t *dst, size_t page_num, size_t page_count);
+static void swap(const char *to, const char *action);
+static void remount_sd(void);
+static uint32_t crc32_buffer(const uint8_t *buf, size_t len);
+static bool write_sd_file_to_path(const char *path, const uint8_t *buf, size_t len,
+                                  bool append, size_t offset, bool quiet);
 
 static joypad_inputs_t read_controller(void) {
     static const uint64_t si_read_controller_block[8] = {
@@ -1009,6 +891,24 @@ static joypad_inputs_t read_controller(void) {
         out.btn.d_left = data.c[0].left;
         out.btn.d_right = data.c[0].right;
     }
+    return out;
+}
+
+static joypad_inputs_t read_controller_combined(void) {
+    joypad_inputs_t out = read_controller();
+
+    joypad_poll();
+    const joypad_buttons_t btn = joypad_get_buttons(JOYPAD_PORT_1);
+    out.btn.a |= btn.a;
+    out.btn.b |= btn.b;
+    out.btn.z |= btn.z;
+    out.btn.l |= btn.l;
+    out.btn.r |= btn.r;
+    out.btn.start |= btn.start;
+    out.btn.c_up |= btn.c_up;
+    out.btn.d_down |= btn.d_down;
+    out.btn.d_left |= btn.d_left;
+    out.btn.d_right |= btn.d_right;
     return out;
 }
 
@@ -1049,6 +949,15 @@ static void set_dom2_save_config(void) {
     *PI_BSD_DOM2_LAT_REG = 0x05;
     *PI_BSD_DOM2_PWD_REG = 0x0C;
     *PI_BSD_DOM2_PGS_REG = 0x0D;
+    *PI_BSD_DOM2_RLS_REG = 0x02;
+    MEMORY_BARRIER();
+}
+
+static void set_dom2_flash_config(void) {
+    wait_pi_idle();
+    *PI_BSD_DOM2_LAT_REG = 0x05;
+    *PI_BSD_DOM2_PWD_REG = 0x0C;
+    *PI_BSD_DOM2_PGS_REG = 0x0F;
     *PI_BSD_DOM2_RLS_REG = 0x02;
     MEMORY_BARRIER();
 }
@@ -1176,42 +1085,210 @@ static void cart_dom2_write(const void *ram, size_t cart_offset, size_t len) {
     dma_wait();
 }
 
-static void flashram_command(uint32_t command) {
-    set_dom2_save_config();
-    io_write(CART_DOM2_ADDR2_START | FLASHRAM_OFFSET_COMMAND, command);
+static void flashram_dom2_read(void *ram, size_t cart_offset, size_t len) {
+    set_dom2_flash_config();
+    data_cache_hit_writeback_invalidate(ram, len);
+    dma_read_raw_async(ram, CART_DOM2_ADDR2_START + cart_offset, len);
+    dma_wait();
 }
 
-static uint32_t flashram_status(void) {
-    flashram_command(FLASHRAM_COMMAND_STATUS_MODE);
+static void flashram_dom2_write(const void *ram, size_t cart_offset, size_t len) {
+    set_dom2_flash_config();
+    data_cache_hit_writeback_invalidate((void *)ram, len);
+    dma_write_raw_async(ram, CART_DOM2_ADDR2_START + cart_offset, len);
+    dma_wait();
+}
+
+static void flashram_command(uint32_t command) {
+    set_dom2_flash_config();
+    wait_pi_idle();
+    io_write(CART_DOM2_ADDR2_START | FLASHRAM_OFFSET_COMMAND, command);
+    MEMORY_BARRIER();
+}
+
+static uint32_t flashram_read_io_base(void) {
+    set_dom2_flash_config();
+    wait_pi_idle();
     return io_read(CART_DOM2_ADDR2_START);
 }
 
-static bool flashram_wait_ready(uint32_t busy_mask, uint32_t ok_mask, uint32_t timeout_ms) {
-    const uint64_t start_ms = get_ticks_ms();
-
-    while (true) {
-        const uint32_t status = flashram_status();
-        if ((status & busy_mask) == 0) {
-            if ((status & ok_mask) == ok_mask) {
-                return true;
-            }
-
-            printf(LOC.flash_status_failed, status);
-            console_render();
-            return false;
-        }
-
-        if ((get_ticks_ms() - start_ms) > timeout_ms) {
-            print_loc(LOC.flash_wait_timeout);
-            console_render();
-            return false;
-        }
-
-        wait_ms(1);
-    }
+static void flashram_write_io_base(uint32_t value) {
+    set_dom2_flash_config();
+    wait_pi_idle();
+    io_write(CART_DOM2_ADDR2_START, value);
+    MEMORY_BARRIER();
 }
 
-static bool flashram_page_is_erased(const uint8_t *page) {
+static void flashram_set_read_mode(void) {
+    flashram_command(FLASHRAM_COMMAND_SET_READ_MODE);
+    (void)flashram_read_io_base(); /* libultra-style dummy read to prime array reads */
+}
+
+static void flashram_read_status(uint8_t *out_status) {
+    uint32_t status;
+
+    flashram_command(FLASHRAM_COMMAND_STATUS_MODE);
+    status = flashram_read_io_base();
+    flashram_command(FLASHRAM_COMMAND_STATUS_MODE);
+    status = flashram_read_io_base();
+    *out_status = (uint8_t)(status & 0xFF);
+}
+
+static uint32_t __attribute__((unused)) flashram_status_word(void) {
+    flashram_command(FLASHRAM_COMMAND_STATUS_MODE);
+    return flashram_read_io_base();
+}
+
+static uint8_t __attribute__((unused)) flashram_status_byte(void) {
+    uint8_t status = 0;
+    flashram_read_status(&status);
+    return status;
+}
+
+static void flashram_clear_status(void) {
+    /* osFlashClearStatus: status mode, then write zero to the base address. */
+    flashram_command(FLASHRAM_COMMAND_STATUS_MODE);
+    flashram_write_io_base(0);
+}
+
+static void flashram_read_id(uint32_t *type_id, uint32_t *vendor_id) {
+    uint32_t ids[2] __attribute__((aligned(16))) = {0};
+    uint8_t ignored_status = 0;
+
+    flashram_read_status(&ignored_status);
+    flashram_command(FLASHRAM_COMMAND_SET_IDENTIFY_MODE);
+    flashram_dom2_read(ids, 0, sizeof(ids));
+
+    *type_id = ids[0];
+    *vendor_id = ids[1];
+}
+
+static void flashram_init_driver(void) {
+    uint32_t type_id = 0;
+    uint32_t vendor_id = 0;
+
+    if (flashram_driver_initialized) {
+        return;
+    }
+
+    flashram_read_id(&type_id, &vendor_id);
+    flashram_driver_type_id = type_id;
+    flashram_driver_vendor_id = vendor_id;
+
+    if (vendor_id == FLASHRAM_VENDOR_MX_PROTO_A ||
+        vendor_id == FLASHRAM_VENDOR_MX_A ||
+        vendor_id == FLASHRAM_VENDOR_MX_C) {
+        flashram_driver_version = FLASHRAM_VERSION_OLD;
+    } else {
+        flashram_driver_version = FLASHRAM_VERSION_NEW;
+    }
+
+    flashram_clear_status();
+    flashram_set_read_mode();
+    flashram_driver_initialized = true;
+}
+
+static size_t flashram_get_addr(size_t page) {
+    flashram_init_driver();
+    if (flashram_driver_version == FLASHRAM_VERSION_OLD) {
+        return page * (FLASHRAM_PAGE_SIZE / 2);
+    }
+    return page * FLASHRAM_PAGE_SIZE;
+}
+
+static void __attribute__((unused)) flashram_wait_operation_delay(uint32_t delay_ms) {
+    wait_ms(delay_ms);
+}
+
+static bool flashram_wait_erase_end(size_t sector, uint32_t timeout_ms, uint8_t *last_status_out) {
+    const uint64_t start_ms = get_ticks_ms();
+    uint8_t status = 0xFF;
+
+    do {
+        wait_ms(13);
+        status = (uint8_t)(flashram_read_io_base() & 0xFF);
+        if ((status & FLASHRAM_STATUS_ERASE_BUSY) == 0) {
+            status = (uint8_t)(flashram_read_io_base() & 0xFF);
+            flashram_clear_status();
+            if (last_status_out != NULL) {
+                *last_status_out = status;
+            }
+            return ((status & FLASHRAM_STATUS_ERASE_OK) == FLASHRAM_STATUS_ERASE_OK) ||
+                   status == 0x48;
+        }
+    } while ((get_ticks_ms() - start_ms) < timeout_ms);
+
+    if (last_status_out != NULL) {
+        *last_status_out = status;
+    }
+    flashram_clear_status();
+    return false;
+}
+
+static bool flashram_wait_program_end(size_t page, uint32_t timeout_ms, uint8_t *last_status_out) {
+    const uint64_t start_ms = get_ticks_ms();
+    uint8_t status = 0xFF;
+
+    do {
+        wait_ms(1);
+        status = (uint8_t)(flashram_read_io_base() & 0xFF);
+        if ((status & FLASHRAM_STATUS_PROGRAM_BUSY) == 0) {
+            status = (uint8_t)(flashram_read_io_base() & 0xFF);
+            flashram_clear_status();
+            if (last_status_out != NULL) {
+                *last_status_out = status;
+            }
+            return ((status & FLASHRAM_STATUS_PROGRAM_OK) == FLASHRAM_STATUS_PROGRAM_OK) ||
+                   status == 0x44;
+        }
+    } while ((get_ticks_ms() - start_ms) < timeout_ms);
+
+    if (last_status_out != NULL) {
+        *last_status_out = status;
+    }
+    flashram_clear_status();
+    return false;
+}
+
+static bool __attribute__((unused)) flashram_wait_status_bit0_clear(const char *phase, size_t index,
+                                            uint32_t timeout_ms) {
+    uint8_t status = 0;
+    const bool ok = flashram_wait_program_end(index, timeout_ms, &status);
+    return ok;
+}
+
+static bool flashram_os_read_array(uint8_t *dst, size_t page_num, size_t page_count) {
+    flashram_init_driver();
+
+    if (page_count == 0) {
+        return true;
+    }
+
+    flashram_command(FLASHRAM_COMMAND_SET_READ_MODE);
+    (void)flashram_read_io_base();
+
+    while (page_count > 0) {
+        size_t pages = page_count;
+        const size_t pages_until_bank_end = 256 - (page_num & 0xFF);
+        if (pages > pages_until_bank_end) {
+            pages = pages_until_bank_end;
+        }
+
+        flashram_dom2_read(dst, flashram_get_addr(page_num), pages * FLASHRAM_PAGE_SIZE);
+
+        dst += pages * FLASHRAM_PAGE_SIZE;
+        page_num += pages;
+        page_count -= pages;
+    }
+
+    return true;
+}
+
+static void __attribute__((unused)) flashram_read_page(size_t page, uint8_t *data) {
+    flashram_os_read_array(data, page, 1);
+}
+
+static bool __attribute__((unused)) flashram_page_is_erased(const uint8_t *page) {
     for (size_t i = 0; i < FLASHRAM_PAGE_SIZE; i++) {
         if (page[i] != 0xFF) {
             return false;
@@ -1222,60 +1299,113 @@ static bool flashram_page_is_erased(const uint8_t *page) {
 }
 
 static bool flashram_erase_sector(size_t sector) {
-    const size_t sector_page = sector * FLASHRAM_PAGES_PER_SECTOR;
+    const uint32_t page = (uint32_t)(sector * FLASHRAM_PAGES_PER_SECTOR);
+    uint8_t status = 0xFF;
+    bool ok;
 
-    flashram_command(FLASHRAM_COMMAND_SECTOR_ERASE_MODE | (uint32_t)sector_page);
+    flashram_init_driver();
+
+    flashram_command(FLASHRAM_COMMAND_SET_ERASE_OFFSET | page);
     flashram_command(FLASHRAM_COMMAND_EXECUTE_ERASE);
-    return flashram_wait_ready(FLASHRAM_STATUS_ERASE_BUSY,
-                               FLASHRAM_STATUS_ERASE_OK, 3000);
+    ok = flashram_wait_erase_end(sector, 5000, &status);
+    flashram_set_read_mode();
+    return ok;
 }
 
 static bool flashram_program_page(size_t page, const uint8_t *data) {
+    uint8_t status = 0xFF;
+    bool ok;
+
+    flashram_init_driver();
+
+    /* osFlashWriteBuffer: select load-page mode, then DMA 128 bytes to devAddr 0. */
     flashram_command(FLASHRAM_COMMAND_PAGE_PROGRAM_MODE);
-    cart_dom2_write(data, 0, FLASHRAM_PAGE_SIZE);
-    flashram_command(FLASHRAM_COMMAND_EXECUTE_PROGRAM | (uint32_t)page);
-    return flashram_wait_ready(FLASHRAM_STATUS_PROGRAM_BUSY,
-                               FLASHRAM_STATUS_PROGRAM_OK, 1000);
+    flashram_dom2_write(data, 0, FLASHRAM_PAGE_SIZE);
+
+    /* osFlashWriteArray: new chips repeat PAGE_PROGRAM before PROGRAM_PAGE. */
+    if (flashram_driver_version == FLASHRAM_VERSION_NEW) {
+        flashram_command(FLASHRAM_COMMAND_PAGE_PROGRAM_MODE);
+    }
+    flashram_command(FLASHRAM_COMMAND_PROGRAM_PAGE | (uint32_t)page);
+
+    ok = flashram_wait_program_end(page, 1000, &status);
+    if (!ok) {
+    }
+    flashram_set_read_mode();
+    return ok;
+}
+
+static size_t __attribute__((unused)) flashram_count_data_diffs(const uint8_t *want, const uint8_t *got) {
+    size_t diffs = 0;
+
+    for (size_t i = 0; i < FLASHRAM_PAGE_SIZE; i++) {
+        if (want[i] != got[i]) {
+            diffs++;
+        }
+    }
+
+    return diffs;
 }
 
 static bool flashram_write_data(const uint8_t *save_buf, size_t len) {
+    uint8_t page_buf[FLASHRAM_PAGE_SIZE] __attribute__((aligned(16)));
+
     if (len != SAVE_FLASH_SIZE) {
         return false;
     }
 
-    const size_t sectors = SAVE_FLASH_SIZE / FLASHRAM_SECTOR_SIZE;
-    const size_t pages = SAVE_FLASH_SIZE / FLASHRAM_PAGE_SIZE;
-
-    for (size_t sector = 0; sector < sectors; sector++) {
+    for (size_t sector = 0; sector < FLASHRAM_SECTOR_COUNT; sector++) {
         print_header();
-        printf(LOC.flash_erasing, (unsigned)(sector + 1), (unsigned)sectors);
-        console_render();
+        printf(LOC.flash_erasing,
+               (unsigned)(sector + 1), (unsigned)FLASHRAM_SECTOR_COUNT);
+        shark_console_render();
 
         if (!flashram_erase_sector(sector)) {
-            flashram_command(FLASHRAM_COMMAND_SET_READ_MODE);
+            printf("Erase failed sector %u\n", (unsigned)sector);
+            shark_console_render();
+            flashram_set_read_mode();
             return false;
         }
     }
 
-    for (size_t page = 0; page < pages; page++) {
-        const uint8_t *page_data = save_buf + (page * FLASHRAM_PAGE_SIZE);
-        if (flashram_page_is_erased(page_data)) {
-            continue;
-        }
-
+    for (size_t page = 0; page < (SAVE_FLASH_SIZE / FLASHRAM_PAGE_SIZE); page++) {
         if ((page % 32) == 0) {
             print_header();
-            printf(LOC.flash_programming, (unsigned)(page + 1), (unsigned)pages);
-            console_render();
+            printf(LOC.flash_programming,
+                   (unsigned)(page + 1),
+                   (unsigned)(SAVE_FLASH_SIZE / FLASHRAM_PAGE_SIZE));
+            shark_console_render();
         }
 
-        if (!flashram_program_page(page, page_data)) {
-            flashram_command(FLASHRAM_COMMAND_SET_READ_MODE);
+        memcpy(page_buf, save_buf + page * FLASHRAM_PAGE_SIZE, FLASHRAM_PAGE_SIZE);
+        if (!flashram_program_page(page, page_buf)) {
+            printf("Program failed page %u\n", (unsigned)page);
+            shark_console_render();
+            flashram_set_read_mode();
             return false;
         }
     }
 
-    flashram_command(FLASHRAM_COMMAND_SET_READ_MODE);
+    flashram_set_read_mode();
+    return true;
+}
+
+static bool flashram_clear_data(void) {
+    for (size_t sector = 0; sector < FLASHRAM_SECTOR_COUNT; sector++) {
+        print_header();
+        printf(LOC.flash_erasing,
+               (unsigned)(sector + 1), (unsigned)FLASHRAM_SECTOR_COUNT);
+        shark_console_render();
+
+        if (!flashram_erase_sector(sector)) {
+            printf("Erase failed sector %u\n", (unsigned)sector);
+            shark_console_render();
+            flashram_set_read_mode();
+            return false;
+        }
+    }
+
+    flashram_set_read_mode();
     return true;
 }
 
@@ -1659,6 +1789,61 @@ static bool cart_size_mirrors_at(size_t size, uint8_t *scratch) {
     return samples > 0;
 }
 
+static bool cart_window_mirrors_after_size(size_t size, size_t window_size,
+                                           uint8_t *scratch) {
+    static const size_t sample_offsets[] = {
+        0x000000, 0x001000, 0x020000, 0x05F000,
+        0x123000, 0x2A5000, 0x3C0000, 0x555000,
+        0x7F0000, 0xA5A000, 0xF00000,
+    };
+
+    const size_t window_start = size - window_size;
+    size_t samples = 0;
+
+    if (window_size == 0 || window_size > size) {
+        return false;
+    }
+
+    for (size_t i = 0; i < ARRAY_COUNT(sample_offsets); i++) {
+        const size_t sample = sample_offsets[i] % window_size;
+        const size_t source = window_start + sample;
+        const size_t mirror = size + sample;
+
+        if ((source + CART_SIZE_PROBE_BLOCK) > size ||
+            (mirror + CART_SIZE_PROBE_BLOCK) > CART_MAX_SIZE) {
+            continue;
+        }
+
+        samples++;
+        if (!cart_probe_blocks_match(scratch, source, mirror)) {
+            return false;
+        }
+    }
+
+    return samples > 0;
+}
+
+static size_t detect_game_cart_windowed_mirror_size(uint8_t *scratch) {
+    static const size_t tail_windows[] = {
+        32 * 0x100000, 20 * 0x100000, 16 * 0x100000,
+        12 * 0x100000, 8 * 0x100000, 4 * 0x100000,
+    };
+
+    for (size_t size = CART_MIN_SIZE; size < CART_MAX_SIZE; size += CART_SIZE_STEP) {
+        for (size_t i = 0; i < ARRAY_COUNT(tail_windows); i++) {
+            if (tail_windows[i] >= size) {
+                continue;
+            }
+
+            if (cart_window_mirrors_after_size(size, tail_windows[i], scratch)) {
+                return size;
+            }
+        }
+    }
+
+    return 0;
+}
+
 static size_t detect_game_cart_size(uint8_t *scratch, size_t scratch_size) {
     if (scratch_size < (CART_SIZE_PROBE_BLOCK * 2)) {
         return 0;
@@ -1668,6 +1853,11 @@ static size_t detect_game_cart_size(uint8_t *scratch, size_t scratch_size) {
         if (cart_size_mirrors_at(size, scratch)) {
             return size;
         }
+    }
+
+    const size_t windowed_mirror_size = detect_game_cart_windowed_mirror_size(scratch);
+    if (windowed_mirror_size != 0) {
+        return windowed_mirror_size;
     }
 
     return CART_MAX_SIZE;
@@ -1681,7 +1871,7 @@ static bool wait_for_valid_game_cart(uint8_t *scratch, size_t scratch_size, uint
         print_loc(LOC.err_crc_scratch_small);
         printf(LOC.err_need_got,
                (unsigned)CART_CHECKSUM_IMAGE_SIZE, (unsigned)scratch_size);
-        console_render();
+        shark_console_render();
         return false;
     }
 
@@ -1691,11 +1881,11 @@ static bool wait_for_valid_game_cart(uint8_t *scratch, size_t scratch_size, uint
                    header[0], header[1], header[2], header[3]);
         } else {
             print_loc(LOC.checking_cart_crc);
-            console_render();
+            shark_console_render();
 
             if (check_game_cart_crc(header, scratch, scratch_size, &crc)) {
                 printf(LOC.crc_ok, crc.cic_name);
-                console_render();
+                shark_console_render();
                 memcpy(out_header, header, CART_HEADER_SIZE);
                 return true;
             }
@@ -1713,7 +1903,7 @@ static bool wait_for_valid_game_cart(uint8_t *scratch, size_t scratch_size, uint
         }
 
         print_loc(LOC.prompt_retry_reinsert);
-        console_render();
+        shark_console_render();
         wait_for_a_press();
     }
 }
@@ -1736,17 +1926,17 @@ static bool wait_for_ready_game_cart(uint8_t *scratch, size_t scratch_size,
 
             print_loc(LOC.err_different_cart);
             print_loc(LOC.prompt_retry_reinsert);
-            console_render();
+            shark_console_render();
             wait_for_a_press();
             continue;
         }
 
         print_loc(LOC.detecting_rom_size);
-        console_render();
+        shark_console_render();
         const size_t detected_size = detect_game_cart_size(scratch, scratch_size);
         if (detected_size == 0) {
             print_loc(LOC.err_size_scratch_small);
-            console_render();
+            shark_console_render();
             return false;
         }
 
@@ -1755,19 +1945,19 @@ static bool wait_for_ready_game_cart(uint8_t *scratch, size_t scratch_size,
         info->selected_size = detected_size;
         printf(LOC.detected_rom_size,
                (unsigned)(detected_size / 0x100000));
-        console_render();
+        shark_console_render();
         return true;
     }
 }
 
 static void print_header(void) {
-    console_clear();
+    shark_console_clear();
     print_loc(LOC.app_header);
 }
 
 static void pause_after_error(void) {
     print_loc(LOC.press_a_continue);
-    console_render();
+    shark_console_render();
     wait_for_a_press();
 }
 
@@ -1795,16 +1985,29 @@ static bool wait_for_clear_combo_or_b(void) {
     do {
         poll_controller();
         wait_ms(16);
-    } while (inputs.btn.b || inputs.btn.l || inputs.btn.r || inputs.btn.z || inputs.btn.start);
+    } while (inputs.btn.b || inputs.btn.l || inputs.btn.z || inputs.btn.start);
 
+    int combo_frames = 0;
     while (true) {
-        poll_controller();
+        inputs = read_controller_combined();
 
-        if (INPUT(btn.b)) {
+        print_header();
+        print_loc(LOC.clear_title);
+        print_loc(LOC.clear_second_warning);
+        print_loc(LOC.prompt_clear_second);
+        shark_console_render();
+
+        if (inputs.btn.b) {
             return false;
         }
-        if (inputs.btn.l && inputs.btn.r && inputs.btn.z && inputs.btn.start) {
-            return true;
+        if (inputs.btn.l && inputs.btn.z && inputs.btn.start) {
+            combo_frames++;
+            if (combo_frames >= 3) {
+                prev_inputs = inputs;
+                return true;
+            }
+        } else {
+            combo_frames = 0;
         }
 
         wait_ms(16);
@@ -1851,9 +2054,8 @@ static bool select_rom_size(cart_info_t *info) {
             print_loc(LOC.detected_suffix);
         }
         print_loc(LOC.newline);
-        print_loc(LOC.newline);
         print_loc(LOC.prompt_left_right_confirm);
-        console_render();
+        shark_console_render();
 
         do {
             poll_controller();
@@ -1902,7 +2104,7 @@ static bool select_dump_mode(dump_mode_t *mode) {
         print_header();
         printf(LOC.dump_mode_label, dump_mode_name((dump_mode_t)selected));
         print_loc(LOC.prompt_left_right_confirm);
-        console_render();
+        shark_console_render();
 
         do {
             poll_controller();
@@ -1933,13 +2135,24 @@ static bool select_dump_mode(dump_mode_t *mode) {
     }
 }
 
-static save_info_t detect_save_info(void) {
-    const eeprom_type_t eeprom = eeprom_present();
+static bool cart_uses_4k_eeprom(const cart_info_t *cart) {
+    if (cart == NULL) {
+        return false;
+    }
+
+    return cart->product[0] == 'N' &&
+           cart->product[1] == 'K' &&
+           cart->product[2] == '4';
+}
+
+static save_info_t detect_save_info(const cart_info_t *cart) {
+    const eeprom_type_t eeprom = eeprom_present_raw();
     if (eeprom == EEPROM_4K || eeprom == EEPROM_16K) {
+        const bool force_4k = cart_uses_4k_eeprom(cart);
         save_info_t info = {
             .kind = SAVE_KIND_EEPROM,
-            .name = (eeprom == EEPROM_4K) ? "EEPROM 4Kbit" : "EEPROM 16Kbit",
-            .size = (eeprom == EEPROM_4K) ? SAVE_EEPROM_4K_SIZE : SAVE_EEPROM_16K_SIZE,
+            .name = (eeprom == EEPROM_4K || force_4k) ? "EEPROM 4Kbit" : "EEPROM 16Kbit",
+            .size = (eeprom == EEPROM_4K || force_4k) ? SAVE_EEPROM_4K_SIZE : SAVE_EEPROM_16K_SIZE,
         };
         return info;
     }
@@ -1948,7 +2161,7 @@ static save_info_t detect_save_info(void) {
     set_dom2_save_config();
     io_write(CART_DOM2_ADDR2_START | FLASHRAM_OFFSET_COMMAND, FLASHRAM_COMMAND_SET_IDENTIFY_MODE);
     cart_dom2_read(flash_id, 0, sizeof(flash_id));
-    io_write(CART_DOM2_ADDR2_START | FLASHRAM_OFFSET_COMMAND, FLASHRAM_COMMAND_SET_READ_MODE);
+    flashram_set_read_mode();
 
     if (flash_id[0] == FLASHRAM_IDENTIFIER) {
         save_info_t info = {
@@ -1969,25 +2182,201 @@ static save_info_t detect_save_info(void) {
 
 static bool read_save_data(uint8_t *save_buf, const save_info_t *save_info) {
     if (save_info->kind == SAVE_KIND_EEPROM) {
-        eeprom_read_bytes(save_buf, 0, save_info->size);
-        return true;
+        return eeprom_read_data_raw(save_buf, save_info->size);
     }
 
     if (save_info->kind == SAVE_KIND_FLASH) {
-        set_dom2_save_config();
-        io_write(CART_DOM2_ADDR2_START | FLASHRAM_OFFSET_COMMAND, FLASHRAM_COMMAND_SET_READ_MODE);
-        cart_dom2_read(save_buf, 0, save_info->size);
-        return true;
+        return flashram_os_read_array(save_buf, 0, save_info->size / FLASHRAM_PAGE_SIZE);
     }
 
     cart_dom2_read(save_buf, 0, save_info->size);
     return true;
 }
 
+static bool eeprom_exec_packet(const void *send, size_t send_len,
+                               void *recv, size_t recv_len) {
+    /*
+     * Libultra packs EEPROM commands onto SI channel 4 after four NOP bytes,
+     * then performs a write/read PIF transaction.  joybus_exec() wraps that
+     * two-phase SI exchange for libdragon, so this helper keeps the packet
+     * layout libultra-compatible while avoiding duplicated boilerplate.
+     */
+    static const uint8_t eeprom_port = 4;
+    uint8_t input[0x40] = {0};
+    uint8_t output[0x40] = {0};
+    size_t pos = eeprom_port;
+
+    if ((pos + 2 + send_len + recv_len + 1) > sizeof(input)) {
+        return false;
+    }
+
+    input[pos++] = (uint8_t)send_len;
+    input[pos++] = (uint8_t)recv_len;
+    memcpy(&input[pos], send, send_len);
+    pos += send_len + recv_len;
+    input[pos] = 0xFE;
+    input[sizeof(input) - 1] = 0x01;
+
+    joybus_exec(input, output);
+    memcpy(recv, &output[pos - recv_len], recv_len);
+    return true;
+}
+
+static uint8_t __attribute__((unused)) eeprom_channel_error(uint8_t status) {
+    return status & 0xC0;
+}
+
+static bool eeprom_status_raw(uint16_t *out_type, uint8_t *out_status) {
+    eeprom_status_cmd_t cmd = { .send = {
+        .command = JOYBUS_COMMAND_ID_STATUS,
+    } };
+
+    if (!eeprom_exec_packet(&cmd.send, sizeof(cmd.send),
+                            &cmd.recv, sizeof(cmd.recv))) {
+        return false;
+    }
+
+    if (out_type != NULL) {
+        *out_type = ((uint16_t)cmd.recv.type_hi << 8) | cmd.recv.type_lo;
+    }
+    if (out_status != NULL) {
+        *out_status = cmd.recv.status;
+    }
+    return true;
+}
+
+static eeprom_type_t eeprom_present_raw(void) {
+    uint16_t type = 0;
+    uint8_t status = 0;
+
+    if (!eeprom_status_raw(&type, &status)) {
+        return EEPROM_NONE;
+    }
+    if ((type & JOYBUS_EEPROM_TYPE) == 0) {
+        return EEPROM_NONE;
+    }
+
+    return (type & JOYBUS_EEPROM_16K_TYPE) ? EEPROM_16K : EEPROM_4K;
+}
+
+static bool eeprom_wait_ready(void) {
+    const uint64_t start_ms = get_ticks_ms();
+
+    while (true) {
+        uint16_t type = 0;
+        uint8_t status = 0;
+
+        if (!eeprom_status_raw(&type, &status)) {
+            return false;
+        }
+        if ((type & JOYBUS_EEPROM_TYPE) == 0) {
+            return false;
+        }
+        if ((status & JOYBUS_EEPROM_BUSY) == 0) {
+            return true;
+        }
+        if ((get_ticks_ms() - start_ms) > JOYBUS_EEPROM_STATUS_TIMEOUT_MS) {
+            return false;
+        }
+
+        wait_ms(1);
+    }
+}
+
+static bool eeprom_read_block_raw(uint8_t block, uint8_t *dst) {
+    eeprom_read_block_cmd_t cmd = { .send = {
+        .command = JOYBUS_COMMAND_ID_EEPROM_READ_BLOCK,
+        .block = block,
+    } };
+
+    if (!eeprom_wait_ready()) {
+        return false;
+    }
+
+    if (!eeprom_exec_packet(&cmd.send, sizeof(cmd.send),
+                            &cmd.recv, sizeof(cmd.recv))) {
+        return false;
+    }
+    if (cmd.recv.status != 0) {
+        return false;
+    }
+
+    memcpy(dst, cmd.recv.data, EEPROM_BLOCK_SIZE);
+    return true;
+}
+
+static bool eeprom_write_block_raw(uint8_t block, const uint8_t *src) {
+    eeprom_write_block_cmd_t cmd = { .send = {
+        .command = JOYBUS_COMMAND_ID_EEPROM_WRITE_BLOCK,
+        .block = block,
+    } };
+
+    if (!eeprom_wait_ready()) {
+        return false;
+    }
+
+    memcpy(cmd.send.data, src, EEPROM_BLOCK_SIZE);
+    if (!eeprom_exec_packet(&cmd.send, sizeof(cmd.send),
+                            &cmd.recv, sizeof(cmd.recv))) {
+        return false;
+    }
+    if (cmd.recv.status != 0) {
+        return false;
+    }
+
+    return eeprom_wait_ready();
+}
+
+static bool eeprom_read_data_raw(uint8_t *save_buf, size_t len) {
+    if ((len % EEPROM_BLOCK_SIZE) != 0) {
+        return false;
+    }
+
+    for (size_t offset = 0; offset < len; offset += EEPROM_BLOCK_SIZE) {
+        const uint8_t block = (uint8_t)(offset / EEPROM_BLOCK_SIZE);
+        if (!eeprom_read_block_raw(block, save_buf + offset)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool eeprom_write_data_verified(const uint8_t *save_buf, size_t len) {
+    uint8_t verify[EEPROM_BLOCK_SIZE];
+
+    if ((len % EEPROM_BLOCK_SIZE) != 0) {
+        return false;
+    }
+
+    for (size_t offset = 0; offset < len; offset += EEPROM_BLOCK_SIZE) {
+        const uint8_t block = (uint8_t)(offset / EEPROM_BLOCK_SIZE);
+        bool ok = false;
+
+        for (int attempt = 0; attempt < 3 && !ok; attempt++) {
+            if (!eeprom_write_block_raw(block, save_buf + offset)) {
+                wait_ms(2);
+                continue;
+            }
+
+            ok = eeprom_read_block_raw(block, verify) &&
+                 memcmp(save_buf + offset, verify, EEPROM_BLOCK_SIZE) == 0;
+            if (!ok) {
+                wait_ms(2);
+            }
+        }
+
+        if (!ok) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 static bool write_save_data_to_cart(const uint8_t *save_buf, const save_info_t *save_info) {
     if (save_info->kind == SAVE_KIND_EEPROM) {
-        eeprom_write_bytes(save_buf, 0, save_info->size);
-        return true;
+        return eeprom_write_data_verified(save_buf, save_info->size);
     }
 
     if (save_info->kind == SAVE_KIND_FLASH) {
@@ -1996,6 +2385,39 @@ static bool write_save_data_to_cart(const uint8_t *save_buf, const save_info_t *
 
     cart_dom2_write(save_buf, 0, save_info->size);
     return true;
+}
+
+static uint8_t clear_save_fill_byte(const save_info_t *save_info) {
+    (void)save_info;
+    return 0xFF;
+}
+
+static bool clear_save_data_on_cart(const uint8_t *save_buf, const save_info_t *save_info) {
+    if (save_info->kind == SAVE_KIND_FLASH) {
+        return flashram_clear_data();
+    }
+
+    if (save_info->kind == SAVE_KIND_EEPROM) {
+        uint8_t clear_block[EEPROM_BLOCK_SIZE];
+        memset(clear_block, save_buf[0], sizeof(clear_block));
+
+        if (!eeprom_write_data_verified(save_buf, save_info->size)) {
+            return false;
+        }
+
+        for (size_t offset = save_info->size; offset < SAVE_EEPROM_16K_SIZE;
+             offset += EEPROM_BLOCK_SIZE) {
+            const uint8_t block = (uint8_t)(offset / EEPROM_BLOCK_SIZE);
+            if (!eeprom_write_block_raw(block, clear_block)) {
+                break;
+            }
+            wait_ms(8);
+        }
+
+        return true;
+    }
+
+    return write_save_data_to_cart(save_buf, save_info);
 }
 
 static bool write_all(int fd, const uint8_t *buf, size_t len) {
@@ -2085,6 +2507,28 @@ static uint32_t crc32_update(uint32_t crc, const uint8_t *buf, size_t len) {
     return crc;
 }
 
+static uint32_t crc32_buffer(const uint8_t *buf, size_t len) {
+    return crc32_update(0xFFFFFFFFu, buf, len) ^ 0xFFFFFFFFu;
+}
+
+static size_t first_diff_offset(const uint8_t *a, const uint8_t *b, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        if (a[i] != b[i]) {
+            return i;
+        }
+    }
+
+    return len;
+}
+
+static void print_hex_bytes(const char *label, const uint8_t *buf, size_t len) {
+    printf("%s", label);
+    for (size_t i = 0; i < len; i++) {
+        printf("%02X", buf[i]);
+    }
+    print_loc(LOC.newline);
+}
+
 static size_t checksum_read_len(size_t buffer_size, size_t remaining) {
     size_t len = buffer_size;
 
@@ -2112,7 +2556,7 @@ static bool checksum_cart_rom(uint8_t *buf, size_t buf_size, size_t rom_size,
     print_loc(LOC.cart_crc32_title);
     print_loc(LOC.cart_crc32_subtitle);
     printf(LOC.mib_progress, (unsigned)0, (unsigned)(rom_size / 0x100000));
-    console_render();
+    shark_console_render();
 
     while (offset < rom_size) {
         const size_t len = checksum_read_len(buf_size, rom_size - offset);
@@ -2128,7 +2572,7 @@ static bool checksum_cart_rom(uint8_t *buf, size_t buf_size, size_t rom_size,
             printf(LOC.mib_progress,
                    (unsigned)(offset / 0x100000),
                    (unsigned)(rom_size / 0x100000));
-            console_render();
+            shark_console_render();
             next_report = offset + 0x100000;
         }
     }
@@ -2142,7 +2586,7 @@ static bool checksum_sd_file(const char *path, uint8_t *buf, size_t buf_size,
     const int fd = open(path, O_RDONLY);
     if (fd == -1) {
         printf(LOC.fmt_failed_open, path, errno);
-        console_render();
+        shark_console_render();
         return false;
     }
 
@@ -2160,7 +2604,7 @@ static bool checksum_sd_file(const char *path, uint8_t *buf, size_t buf_size,
 
         if (!read_all(fd, buf, len)) {
             printf(LOC.fmt_failed_read, path, errno);
-            console_render();
+            shark_console_render();
             close(fd);
             return false;
         }
@@ -2175,14 +2619,14 @@ static bool checksum_sd_file(const char *path, uint8_t *buf, size_t buf_size,
             printf(LOC.mib_progress,
                    (unsigned)(offset / 0x100000),
                    (unsigned)(size / 0x100000));
-            console_render();
+            shark_console_render();
             next_report = offset + 0x100000;
         }
     }
 
     if (close(fd) == -1) {
         printf(LOC.fmt_failed_close, path, errno);
-        console_render();
+        shark_console_render();
         return false;
     }
 
@@ -2241,6 +2685,20 @@ static bool format_restore_path(char *out, size_t out_size, const char *dir, con
     return true;
 }
 
+static bool append_part_suffix(char *out, size_t out_size, const char *path) {
+    static const char suffix[] = ".part";
+    const size_t path_len = strlen(path);
+    const size_t suffix_len = sizeof(suffix) - 1;
+
+    if ((path_len + suffix_len) >= out_size) {
+        return false;
+    }
+
+    memcpy(out, path, path_len);
+    memcpy(out + path_len, suffix, suffix_len + 1);
+    return true;
+}
+
 static void cart_save_filename(char *out, size_t out_size, const cart_info_t *cart) {
     char path[RESTORE_PATH_LEN];
 
@@ -2288,7 +2746,7 @@ static bool confirm_restore_identity_warning(const restore_file_t *file,
         printf(LOC.plain_line_spaced, file->name);
         printf(LOC.expected_like, expected_name);
         print_loc(LOC.prompt_restore_anyway);
-        console_render();
+        shark_console_render();
         return wait_for_a_or_b();
     }
 
@@ -2314,7 +2772,7 @@ static bool confirm_restore_identity_warning(const restore_file_t *file,
         }
         print_loc(LOC.newline);
         print_loc(LOC.prompt_restore_anyway);
-        console_render();
+        shark_console_render();
         return wait_for_a_or_b();
     }
 
@@ -2322,7 +2780,7 @@ static bool confirm_restore_identity_warning(const restore_file_t *file,
     print_loc(LOC.restore_does_not_match);
     printf(LOC.file_label, file->name);
     printf(LOC.cart_label, expected_name);
-    console_render();
+    shark_console_render();
     return false;
 }
 
@@ -2335,6 +2793,28 @@ static bool restore_file_size(int64_t dir_size, size_t *out_size) {
     return false;
 }
 
+static bool restore_file_size_from_path(const char *path, int64_t dir_size, size_t *out_size) {
+    struct stat st;
+
+    if (restore_file_size(dir_size, out_size)) {
+        return true;
+    }
+
+    if (stat(path, &st) == 0) {
+        return restore_file_size(st.st_size, out_size);
+    }
+
+    const int fd = open(path, O_RDONLY);
+    if (fd == -1) {
+        return false;
+    }
+
+    const off_t end = lseek(fd, 0, SEEK_END);
+    close(fd);
+
+    return restore_file_size(end, out_size);
+}
+
 static int load_restore_files_from_dir(restore_file_t *files, int max_files, const char *dir_path) {
     dir_t dir;
     int count = 0;
@@ -2342,11 +2822,13 @@ static int load_restore_files_from_dir(restore_file_t *files, int max_files, con
 
     while (res == 0 && count < max_files) {
         size_t file_size = 0;
+        char path[RESTORE_PATH_LEN];
         if (dir.d_type != DT_DIR &&
             ascii_ends_with_casefold(dir.d_name, ".sav") &&
             copy_cstr_checked(files[count].name, sizeof(files[count].name), dir.d_name) &&
-            format_restore_path(files[count].path, sizeof(files[count].path), dir_path, dir.d_name) &&
-            restore_file_size(dir.d_size, &file_size)) {
+            format_restore_path(path, sizeof(path), dir_path, dir.d_name) &&
+            restore_file_size_from_path(path, dir.d_size, &file_size) &&
+            copy_cstr_checked(files[count].path, sizeof(files[count].path), path)) {
             files[count].size = file_size;
             count++;
         }
@@ -2360,10 +2842,7 @@ static int load_restore_files_from_dir(restore_file_t *files, int max_files, con
 static int load_restore_files(restore_file_t *files, int max_files,
                               const char **used_dir, const char **last_dir) {
     static const char *dir_paths[] = {
-        "sd:/restore",
-        "sd:/restore/",
-        "sd://restore",
-        "sd://restore/",
+        RESTORE_DIR
     };
 
     *used_dir = NULL;
@@ -2380,6 +2859,172 @@ static int load_restore_files(restore_file_t *files, int max_files,
     return 0;
 }
 
+static int load_part_files_from_dir(part_file_t *files, int max_files, const char *dir_path) {
+    dir_t dir;
+    int count = 0;
+    int res = dir_findfirst(dir_path, &dir);
+
+    while (res == 0 && count < max_files) {
+        char path[PART_PATH_LEN];
+        dump_part_meta_t meta;
+
+        if (dir.d_type != DT_DIR &&
+            ascii_ends_with_casefold(dir.d_name, ".part") &&
+            copy_cstr_checked(files[count].name, sizeof(files[count].name), dir.d_name) &&
+            format_restore_path(path, sizeof(path), dir_path, dir.d_name) &&
+            read_part_meta(path, &meta) &&
+            copy_cstr_checked(files[count].path, sizeof(files[count].path), path)) {
+            files[count].meta = meta;
+            files[count].meta_valid = true;
+            count++;
+        }
+
+        res = dir_findnext(dir_path, &dir);
+    }
+
+    return count;
+}
+
+static int load_part_files(part_file_t *files, int max_files) {
+    static const char *const dir_paths[] = {
+        ROM_DUMP_DIR,
+        "sd:",
+    };
+    int count = 0;
+
+    for (size_t i = 0; i < ARRAY_COUNT(dir_paths) && count < max_files; i++) {
+        count += load_part_files_from_dir(files + count, max_files - count, dir_paths[i]);
+    }
+
+    return count;
+}
+
+static bool read_part_meta(const char *path, dump_part_meta_t *meta) {
+    const int fd = open(path, O_RDONLY);
+    if (fd == -1) {
+        return false;
+    }
+
+    const bool ok = read_all(fd, (uint8_t *)meta, sizeof(*meta)) &&
+                    meta->magic == PART_META_MAGIC &&
+                    meta->version == PART_META_VERSION;
+    close(fd);
+    return ok;
+}
+
+static bool part_matches_cart(const part_file_t *file, const cart_info_t *cart,
+                              dump_part_meta_t *meta) {
+    char expected_rom[sizeof(cart->rom_path)];
+    char expected_part[PART_NAME_LEN];
+
+    format_cart_file_path(expected_rom, sizeof(expected_rom), cart, "sd:", "z64");
+    if (!append_part_suffix(expected_part, sizeof(expected_part), path_basename(expected_rom))) {
+        return false;
+    }
+
+    if (!file->meta_valid || !ascii_streq_casefold(file->name, expected_part)) {
+        return false;
+    }
+
+    *meta = file->meta;
+    return ascii_streq_casefold(meta->product, cart->product) &&
+           meta->revision == cart->revision &&
+           meta->rom_size != 0 &&
+           meta->offset < meta->rom_size;
+}
+
+static bool find_resume_part(const part_file_t *files, int count, const cart_info_t *cart,
+                             dump_part_meta_t *meta, char *rom_path, size_t rom_path_size) {
+    for (int i = 0; i < count; i++) {
+        if (!part_matches_cart(&files[i], cart, meta)) {
+            continue;
+        }
+
+        const size_t path_len = strlen(files[i].path);
+        const size_t suffix_len = strlen(".part");
+        if (path_len <= suffix_len || (path_len - suffix_len) >= rom_path_size) {
+            continue;
+        }
+
+        memcpy(rom_path, files[i].path, path_len - suffix_len);
+        rom_path[path_len - suffix_len] = '\0';
+        return true;
+    }
+
+    return false;
+}
+
+static bool find_resume_part_direct(const cart_info_t *cart, dump_part_meta_t *meta,
+                                    char *rom_path, size_t rom_path_size) {
+    static const char *const dirs[] = {
+        ROM_DUMP_DIR,
+        "sd:",
+    };
+    char expected_rom[PART_PATH_LEN];
+    char expected_part[PART_PATH_LEN];
+
+    for (size_t i = 0; i < ARRAY_COUNT(dirs); i++) {
+        format_cart_file_path(expected_rom, sizeof(expected_rom), cart, dirs[i], "z64");
+        if (!append_part_suffix(expected_part, sizeof(expected_part), expected_rom)) {
+            continue;
+        }
+
+        if (!read_part_meta(expected_part, meta) ||
+            !ascii_streq_casefold(meta->product, cart->product) ||
+            meta->revision != cart->revision ||
+            meta->rom_size == 0 ||
+            meta->offset >= meta->rom_size ||
+            !copy_cstr_checked(rom_path, rom_path_size, expected_rom)) {
+            continue;
+        }
+
+        return true;
+    }
+
+    return false;
+}
+
+static bool confirm_resume_dump(const cart_info_t *cart, const dump_part_meta_t *meta) {
+    print_header();
+    print_loc(LOC.resume_title);
+    printf(LOC.title_label, cart->title);
+    print_revision_suffix(cart->revision);
+    print_loc(LOC.newline);
+    printf(LOC.resume_offset,
+           (unsigned)(meta->offset / 0x100000),
+           (unsigned)(meta->rom_size / 0x100000));
+    print_loc(LOC.prompt_resume_dump);
+    shark_console_render();
+    return wait_for_a_or_b();
+}
+
+static bool write_part_meta(const cart_info_t *cart, size_t offset, uint32_t cart_crc32) {
+    char part_path[PART_PATH_LEN];
+    dump_part_meta_t meta = {
+        .magic = PART_META_MAGIC,
+        .version = PART_META_VERSION,
+        .revision = cart->revision,
+        .rom_size = (uint32_t)cart->selected_size,
+        .offset = (uint32_t)offset,
+        .cart_crc32 = cart_crc32,
+    };
+
+    memcpy(meta.product, cart->product, sizeof(meta.product));
+    if (!append_part_suffix(part_path, sizeof(part_path), cart->rom_path)) {
+        return false;
+    }
+
+    return write_sd_file_to_path(part_path, (const uint8_t *)&meta, sizeof(meta), false, 0, true);
+}
+
+static void delete_part_meta(const cart_info_t *cart) {
+    char part_path[PART_PATH_LEN];
+
+    if (append_part_suffix(part_path, sizeof(part_path), cart->rom_path)) {
+        unlink(part_path);
+    }
+}
+
 static bool select_restore_file(restore_file_t *files, int count,
                                 const char *restore_dir, int *selected) {
     int index = 0;
@@ -2391,7 +3036,7 @@ static bool select_restore_file(restore_file_t *files, int count,
         printf(LOC.plain_line, files[index].name);
         printf(LOC.bytes_line, (unsigned)files[index].size);
         print_loc(LOC.prompt_left_right_confirm);
-        console_render();
+        shark_console_render();
 
         do {
             poll_controller();
@@ -2426,21 +3071,21 @@ static uint8_t *load_restore_save_file(const restore_file_t *file) {
     uint8_t *buf = malloc(file->size);
     if (buf == NULL) {
         printf(LOC.err_alloc_save, errno);
-        console_render();
+        shark_console_render();
         return NULL;
     }
 
     const int fd = open(file->path, O_RDONLY);
     if (fd == -1) {
         printf(LOC.fmt_failed_open, file->path, errno);
-        console_render();
+        shark_console_render();
         free(buf);
         return NULL;
     }
 
     if (!read_all(fd, buf, file->size)) {
         printf(LOC.fmt_failed_read, file->path, errno);
-        console_render();
+        shark_console_render();
         close(fd);
         free(buf);
         return NULL;
@@ -2457,7 +3102,7 @@ static bool confirm_save_overwrite(const char *path) {
 
     printf(LOC.save_exists, path);
     print_loc(LOC.prompt_overwrite_cancel);
-    console_render();
+    shark_console_render();
     return wait_for_a_or_b();
 }
 
@@ -2470,7 +3115,7 @@ static int open_sd_output_file(const char *path, bool append, bool quiet) {
     const int fd = open(path, flags, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH);
     if (fd == -1 && !quiet) {
         printf(LOC.fmt_failed_open, path, errno);
-        console_render();
+        shark_console_render();
     }
 
     return fd;
@@ -2485,21 +3130,21 @@ static bool write_sd_file_to_path(const char *path, const uint8_t *buf, size_t l
 
     if (lseek(fd, offset, SEEK_SET) == -1) {
         printf(LOC.fmt_failed_seek, path, errno);
-        console_render();
+        shark_console_render();
         close(fd);
         return false;
     }
 
     if (!write_all(fd, buf, len)) {
         printf(LOC.fmt_failed_write, path, errno);
-        console_render();
+        shark_console_render();
         close(fd);
         return false;
     }
 
     if (close(fd) == -1) {
         printf(LOC.fmt_failed_close, path, errno);
-        console_render();
+        shark_console_render();
         return false;
     }
 
@@ -2521,7 +3166,7 @@ static comp_block_header_t comp_read_header(const uint8_t *src) {
 }
 
 static void draw_dump_progress(void) {
-    console_clear();
+    shark_console_clear();
     print_loc(LOC.app_header);
 
     if (dprog.cart) {
@@ -2530,6 +3175,10 @@ static void draw_dump_progress(void) {
         print_loc(LOC.newline);
         printf(LOC.progress_size,
                (unsigned)(dprog.total_size / 0x100000));
+        if (dprog.read_kbs != 0) {
+            printf(" - %u KB/s", (unsigned)dprog.read_kbs);
+        }
+        print_loc(LOC.newline);
     }
 
     {
@@ -2548,10 +3197,6 @@ static void draw_dump_progress(void) {
                (unsigned)(dprog.total_size / 0x100000));
     }
 
-    if (dprog.read_kbs != 0) {
-        printf(LOC.progress_speed, (unsigned)dprog.read_kbs);
-    }
-
     {
         int filled = dprog.total_size > 0
             ? (int)((dprog.write_addr * PROGRESS_BAR_WIDTH) / dprog.total_size)
@@ -2568,7 +3213,7 @@ static void draw_dump_progress(void) {
                (unsigned)(dprog.total_size / 0x100000));
     }
 
-    console_render();
+    shark_console_render();
 }
 
 static bool abort_combo_pressed(void) {
@@ -2832,7 +3477,7 @@ static bool write_compressed_pass_to_sd(const char *path, uint8_t *comp_buf,
 
     if (lseek(fd, pass->raw_start, SEEK_SET) == -1) {
         printf(LOC.fmt_failed_seek, path, errno);
-        console_render();
+        shark_console_render();
         close(fd);
         return false;
     }
@@ -2866,14 +3511,14 @@ static bool write_compressed_pass_to_sd(const char *path, uint8_t *comp_buf,
 
         if (lseek(fd, tail_offset, SEEK_SET) == -1) {
             printf(LOC.fmt_failed_seek, path, errno);
-            console_render();
+            shark_console_render();
             close(fd);
             return false;
         }
 
         if (!write_all(fd, tail_bufs[i], pass->raw_tail_size[i])) {
             printf(LOC.fmt_failed_write, path, errno);
-            console_render();
+            shark_console_render();
             close(fd);
             return false;
         }
@@ -2883,7 +3528,7 @@ static bool write_compressed_pass_to_sd(const char *path, uint8_t *comp_buf,
 
     if (raw_tail_total != 0 && lseek(fd, pass->raw_start, SEEK_SET) == -1) {
         printf(LOC.fmt_failed_seek, path, errno);
-        console_render();
+        shark_console_render();
         close(fd);
         return false;
     }
@@ -2910,21 +3555,21 @@ static bool write_compressed_pass_to_sd(const char *path, uint8_t *comp_buf,
         if (raw) {
             if (!write_all(fd, comp_buf + in_pos, payload_size)) {
                 printf(LOC.fmt_failed_write, path, errno);
-                console_render();
+                shark_console_render();
                 close(fd);
                 return false;
             }
         } else {
             if (!comp_lz4_decode_block(comp_buf + in_pos, payload_size, scratch_buf, raw_size)) {
                 print_loc(LOC.err_decompress_chunk);
-                console_render();
+                shark_console_render();
                 close(fd);
                 return false;
             }
 
             if (!write_all(fd, scratch_buf, raw_size)) {
                 printf(LOC.fmt_failed_write, path, errno);
-                console_render();
+                shark_console_render();
                 close(fd);
                 return false;
             }
@@ -2943,7 +3588,7 @@ static bool write_compressed_pass_to_sd(const char *path, uint8_t *comp_buf,
 
     if (close(fd) == -1) {
         printf(LOC.fmt_failed_close, path, errno);
-        console_render();
+        shark_console_render();
         return false;
     }
 
@@ -2994,7 +3639,7 @@ static bool write_save_file_to_sd(cart_info_t *cart, const uint8_t *save_buf,
     format_cart_file_path(path, sizeof(path), cart, SAVE_DUMP_DIR, "sav");
     if (file_exists(path) && !confirm_save_overwrite(path)) {
         print_loc(LOC.save_write_cancelled);
-        console_render();
+        shark_console_render();
         return false;
     }
 
@@ -3006,7 +3651,7 @@ static bool write_save_file_to_sd(cart_info_t *cart, const uint8_t *save_buf,
     format_cart_file_path(path, sizeof(path), cart, "sd:", "sav");
     if (!confirm_save_overwrite(path)) {
         print_loc(LOC.save_write_cancelled);
-        console_render();
+        shark_console_render();
         return false;
     }
 
@@ -3064,7 +3709,7 @@ static void swap_reset_callback(void) {
 
 static void swap_setup_callback(void) {
     print_loc(LOC.prompt_reset_now);
-    console_render();
+    shark_console_render();
 }
 
 static void ensure_pif_hung(void) {
@@ -3077,10 +3722,12 @@ static void ensure_pif_hung(void) {
 }
 
 static void swap(const char *to, const char *action) {
+    (void)to;
+    (void)action;
     ensure_pif_hung();
 
-    printf(LOC.prompt_swap, to, action);
-    console_render();
+    print_loc(LOC.prompt_swap);
+    shark_console_render();
 }
 
 static void prepare_flashcart_removal(void) {
@@ -3093,19 +3740,13 @@ static void remount_sd(void) {
 
     while (cart_init() < 0) {
         print_loc(LOC.prompt_flashcart_retry);
-        console_render();
-        wait_for_a_press();
-    }
-
-    while (cart_card_init() < 0) {
-        print_loc(LOC.prompt_sd_retry);
-        console_render();
+        shark_console_render();
         wait_for_a_press();
     }
 
     while (!sdfs_mount("sd:/", -1)) {
-        printf(LOC.prompt_mount_retry, errno);
-        console_render();
+        printf(LOC.prompt_mount_retry, errno, sdfs_last_mount_result);
+        shark_console_render();
         wait_for_a_press();
     }
 
@@ -3118,9 +3759,14 @@ void dump_rom(void) {
     cart_info_t cart = {0};
     dump_mode_t dump_mode = DUMP_MODE_ROM_AND_SAVE;
     save_info_t save_info = {0};
+    part_file_t *part_files = NULL;
+    int part_count = 0;
+    dump_part_meta_t resume_meta = {0};
     uint8_t *crc_buf = NULL;
     uint8_t *comp_buf = NULL;
     uint8_t *save_buf = NULL;
+    bool save_buf_owned = false;
+    size_t save_buf_reserve = 0;
     size_t chunk = 0;
     size_t offset = 0;
     compression_settings_t comp_settings = {
@@ -3140,8 +3786,22 @@ void dump_rom(void) {
     crc_buf = malloc(CART_CHECKSUM_IMAGE_SIZE);
     if (crc_buf == NULL) {
         printf(LOC.err_alloc_crc, errno);
-        console_render();
+        shark_console_render();
         return;
+    }
+
+    while (!sdfs_mount("sd:/", -1)) {
+        printf(LOC.prompt_mount_retry, errno, sdfs_last_mount_result);
+        shark_console_render();
+        wait_for_a_press();
+        print_header();
+    }
+
+    part_files = malloc(sizeof(part_file_t) * MAX_PART_FILES);
+    if (part_files != NULL) {
+        part_count = load_part_files(part_files, MAX_PART_FILES);
+    } else {
+        part_count = 0;
     }
 
     prepare_flashcart_removal();
@@ -3152,26 +3812,47 @@ void dump_rom(void) {
         pause_after_error();
     }
 
-    if (ok && (!select_rom_size(&cart) || !select_dump_mode(&dump_mode))) {
+    bool resume_dump = false;
+    if (ok) {
+        char resume_rom_path[sizeof(cart.rom_path)];
+        const bool found_resume =
+            (part_files != NULL &&
+             find_resume_part(part_files, part_count, &cart,
+                              &resume_meta, resume_rom_path, sizeof(resume_rom_path))) ||
+            find_resume_part_direct(&cart, &resume_meta,
+                                    resume_rom_path, sizeof(resume_rom_path));
+        if (found_resume &&
+            confirm_resume_dump(&cart, &resume_meta)) {
+            copy_cstr_checked(cart.rom_path, sizeof(cart.rom_path), resume_rom_path);
+            cart.selected_size = resume_meta.rom_size;
+            cart.detected_size = resume_meta.rom_size;
+            offset = resume_meta.offset;
+            cart_full_crc = resume_meta.cart_crc32;
+            have_cart_full_crc = cart_full_crc != 0;
+            dump_mode = DUMP_MODE_ROM_ONLY;
+            resume_dump = true;
+        }
+    }
+
+    if (part_files != NULL) {
+        free(part_files);
+        part_files = NULL;
+        part_count = 0;
+    }
+
+    if (ok && !resume_dump &&
+        (!select_rom_size(&cart) || !select_dump_mode(&dump_mode))) {
         ok = false;
     }
 
     if (ok && dump_mode != DUMP_MODE_ROM_ONLY) {
-        save_info = detect_save_info();
-        save_buf = malloc(save_info.size);
-        if (save_buf == NULL) {
-            printf(LOC.err_alloc_save, errno);
-            console_render();
-            ok = false;
-            pause_after_error();
-        } else {
-            printf(LOC.reading_save,
-                   save_info.name, (unsigned)save_info.size);
-            console_render();
-
-            if (!read_save_data(save_buf, &save_info)) {
-                print_loc(LOC.err_read_save_data);
-                console_render();
+        save_info = detect_save_info(&cart);
+        if (dump_mode == DUMP_MODE_SAVE_ONLY) {
+            save_buf = malloc(save_info.size);
+            save_buf_owned = save_buf != NULL;
+            if (save_buf == NULL) {
+                printf(LOC.err_alloc_save, errno);
+                shark_console_render();
                 ok = false;
                 pause_after_error();
             }
@@ -3186,14 +3867,39 @@ void dump_rom(void) {
         comp_buf = malloc_largest_rom_buffer(&chunk, mem_size);
         if (comp_buf == NULL) {
             printf(LOC.err_alloc_rom, errno);
-            console_render();
+            shark_console_render();
             ok = false;
             pause_after_error();
         } else {
-            printf(LOC.rom_buffer, (unsigned)(chunk / 1024));
+            if (dump_mode == DUMP_MODE_ROM_AND_SAVE) {
+                save_buf_reserve = (save_info.size + 15u) & ~(size_t)15u;
+                if (chunk <= save_buf_reserve + COMP_BLOCK_DEFAULT) {
+                    printf(LOC.err_alloc_save, errno);
+                    shark_console_render();
+                    ok = false;
+                    pause_after_error();
+                } else {
+                    save_buf = comp_buf + chunk - save_buf_reserve;
+                    chunk -= save_buf_reserve;
+                }
+            }
+
             print_loc(LOC.compression_label);
             printf(LOC.compression_blocks_short, (unsigned)(comp_settings.block_size / 1024));
-            console_render();
+            shark_console_render();
+        }
+    }
+
+    if (ok && dump_mode != DUMP_MODE_ROM_ONLY) {
+        printf(LOC.reading_save,
+               save_info.name, (unsigned)save_info.size);
+        shark_console_render();
+
+        if (!read_save_data(save_buf, &save_info)) {
+            print_loc(LOC.err_read_save_data);
+            shark_console_render();
+            ok = false;
+            pause_after_error();
         }
     }
 
@@ -3204,7 +3910,7 @@ void dump_rom(void) {
         } else {
             have_cart_full_crc = true;
             printf(LOC.cart_crc32_result, cart_full_crc);
-            console_render();
+            shark_console_render();
         }
     }
 
@@ -3234,14 +3940,14 @@ void dump_rom(void) {
             if (dump_abort_requested) {
                 print_header();
                 print_loc(LOC.chunk_cancelled);
-                console_render();
+                shark_console_render();
                 ok = false;
                 pause_after_error();
                 break;
             }
 
             print_loc(LOC.err_compress_pass);
-            console_render();
+            shark_console_render();
             ok = false;
             pause_after_error();
             break;
@@ -3255,13 +3961,10 @@ void dump_rom(void) {
             raw_tail_total += pass.raw_tail_size[i];
         }
         printf(LOC.compressed_summary,
-               (unsigned)((pass.raw_size - raw_tail_total) / 1024),
-               (unsigned)(pass.comp_size / 1024));
-        if (raw_tail_total != 0) {
-            printf(LOC.raw_tail_summary, (unsigned)(raw_tail_total / 1024));
-        }
+               (unsigned)(pass.raw_size / 1024),
+               (unsigned)((pass.comp_size + raw_tail_total) / 1024));
         print_loc(LOC.newline);
-        console_render();
+        shark_console_render();
 
         swap("flashcart", "write");
         wait_for_a_press();
@@ -3275,9 +3978,12 @@ void dump_rom(void) {
             }
 
             printf(LOC.wrote_save, cart.save_path);
-            console_render();
-            free(save_buf);
+            shark_console_render();
+            if (save_buf_owned) {
+                free(save_buf);
+            }
             save_buf = NULL;
+            save_buf_owned = false;
             save_freed_this_pass = true;
         }
 
@@ -3311,21 +4017,27 @@ void dump_rom(void) {
         printf(LOC.wrote_chunk,
                (unsigned)pass.raw_start,
                (unsigned)(pass.raw_start + pass.raw_size));
-        console_render();
+        shark_console_render();
         offset += pass.raw_size;
+        if (offset < cart.selected_size) {
+            write_part_meta(&cart, offset, cart_full_crc);
+        }
 
-        if (save_freed_this_pass && offset < cart.selected_size) {
+        if (save_freed_this_pass && save_buf_reserve != 0) {
+            chunk += save_buf_reserve;
+            save_buf_reserve = 0;
+            shark_console_render();
+        } else if (save_freed_this_pass && offset < cart.selected_size) {
             const size_t old_chunk = chunk;
             if (!realloc_largest_rom_buffer(&comp_buf, &chunk, mem_size)) {
                 printf(LOC.err_alloc_rom, errno);
-                console_render();
+                shark_console_render();
                 ok = false;
                 pause_after_error();
                 break;
             }
             if (chunk > old_chunk) {
-                printf(LOC.rom_buffer, (unsigned)(chunk / 1024));
-                console_render();
+                shark_console_render();
             }
         }
 
@@ -3343,7 +4055,7 @@ void dump_rom(void) {
             printf(LOC.sd_crc_line, sd_full_crc);
             printf(LOC.checksum_status, (sd_full_crc == cart_full_crc) ? LOC.checksum_matches : LOC.checksum_mismatch);
             print_loc(LOC.press_a_continue);
-            console_render();
+            shark_console_render();
             wait_for_a_press();
             if (sd_full_crc != cart_full_crc) {
                 ok = false;
@@ -3361,16 +4073,21 @@ void dump_rom(void) {
             pause_after_error();
         } else {
             printf(LOC.wrote_save, cart.save_path);
-            console_render();
+            shark_console_render();
         }
     }
 
     if (ok) {
+        if (dump_mode != DUMP_MODE_SAVE_ONLY) {
+            delete_part_meta(&cart);
+        }
         print_loc(LOC.success);
-        console_render();
+        shark_console_render();
     }
 
-    free(save_buf);
+    if (save_buf_owned) {
+        free(save_buf);
+    }
     free(comp_buf);
     free(crc_buf);
 }
@@ -3381,18 +4098,18 @@ void dump_to_accessory(void) {
     joypad_port_t port;
     if (!accessory_find(&port)) {
         print_loc(LOC.err_no_accessory);
-        console_render();
+        shark_console_render();
 
         return;
     }
 
     printf(LOC.accessory_found, port + 1);
-    console_render();
+    shark_console_render();
 
     uint8_t *const crc_buf = malloc(CART_CHECKSUM_IMAGE_SIZE);
     if (crc_buf == NULL) {
         printf(LOC.err_alloc_crc, errno);
-        console_render();
+        shark_console_render();
 
         return;
     }
@@ -3410,12 +4127,12 @@ void dump_to_accessory(void) {
     free(crc_buf);
 
     printf(LOC.streaming_accessory, port + 1);
-    console_render();
+    shark_console_render();
 
     accessory_dump_stream(port, cart.selected_size);
 
     print_loc(LOC.verifying);
-    console_render();
+    shark_console_render();
 
     accessory_verify(port, cart.selected_size);
 }
@@ -3424,8 +4141,8 @@ void restore_save(void) {
     print_header();
 
     while (!sdfs_mount("sd:/", -1)) {
-        printf(LOC.prompt_mount_retry, errno);
-        console_render();
+        printf(LOC.prompt_mount_retry, errno, sdfs_last_mount_result);
+        shark_console_render();
         wait_for_a_press();
         print_header();
     }
@@ -3440,7 +4157,7 @@ void restore_save(void) {
         print_loc(LOC.no_sav_files);
         printf(LOC.last_tried, last_restore_dir ? last_restore_dir : RESTORE_DIR);
         print_loc(LOC.press_a_continue);
-        console_render();
+        shark_console_render();
         wait_for_a_press();
         return;
     }
@@ -3459,7 +4176,7 @@ void restore_save(void) {
     uint8_t *verify_buf = malloc(SAVE_FLASH_SIZE);
     if (verify_buf == NULL) {
         printf(LOC.err_alloc_verify, errno);
-        console_render();
+        shark_console_render();
         free(save_buf);
         pause_after_error();
         return;
@@ -3468,7 +4185,7 @@ void restore_save(void) {
     uint8_t *crc_buf = malloc(CART_CHECKSUM_IMAGE_SIZE);
     if (crc_buf == NULL) {
         printf(LOC.err_alloc_crc, errno);
-        console_render();
+        shark_console_render();
         free(verify_buf);
         free(save_buf);
         pause_after_error();
@@ -3498,7 +4215,7 @@ void restore_save(void) {
     }
 
     if (ok) {
-        save_info = detect_save_info();
+        save_info = detect_save_info(&cart);
         if (file->size < save_info.size) {
             print_header();
             print_loc(LOC.save_too_small);
@@ -3514,7 +4231,7 @@ void restore_save(void) {
             printf(LOC.truncate_restore,
                    (unsigned)save_info.size);
             print_loc(LOC.prompt_continue_cancel);
-            console_render();
+            shark_console_render();
             if (!wait_for_a_or_b()) {
                 ok = false;
             }
@@ -3528,7 +4245,7 @@ void restore_save(void) {
         print_revision_suffix(cart.revision);
         print_loc(LOC.restore_confirm_body);
         print_loc(LOC.prompt_restore_anyway);
-        console_render();
+        shark_console_render();
 
         if (!wait_for_a_or_b()) {
             ok = false;
@@ -3538,7 +4255,7 @@ void restore_save(void) {
     if (ok) {
         print_header();
         printf(LOC.writing_save, save_info.name);
-        console_render();
+        shark_console_render();
 
         if (!write_save_data_to_cart(save_buf, &save_info)) {
             ok = false;
@@ -3546,14 +4263,23 @@ void restore_save(void) {
         }
     }
 
+
     if (ok) {
         print_loc(LOC.verifying);
-        console_render();
+        shark_console_render();
 
         if (!read_save_data(verify_buf, &save_info) ||
             memcmp(save_buf, verify_buf, save_info.size) != 0) {
+            const uint32_t want_crc = crc32_buffer(save_buf, save_info.size);
+            const uint32_t got_crc = crc32_buffer(verify_buf, save_info.size);
+            const size_t diff = first_diff_offset(save_buf, verify_buf, save_info.size);
             print_header();
             print_loc(LOC.restore_verify_failed);
+            printf("Want: %08" PRIX32 "\n", want_crc);
+            printf("Got:  %08" PRIX32 "\n", got_crc);
+            printf("Diff: %06X\n", (unsigned)diff);
+            print_hex_bytes("W0:", save_buf, 8);
+            print_hex_bytes("G0:", verify_buf, 8);
             ok = false;
             pause_after_error();
         }
@@ -3563,7 +4289,7 @@ void restore_save(void) {
         print_header();
         print_loc(LOC.restore_success);
         print_loc(LOC.press_a_continue);
-        console_render();
+        shark_console_render();
         wait_for_a_press();
     }
 
@@ -3578,7 +4304,7 @@ void clear_cart_save(void) {
     uint8_t *crc_buf = malloc(CART_CHECKSUM_IMAGE_SIZE);
     if (crc_buf == NULL) {
         printf(LOC.err_alloc_crc, errno);
-        console_render();
+        shark_console_render();
         pause_after_error();
         return;
     }
@@ -3597,9 +4323,12 @@ void clear_cart_save(void) {
     save_info_t save_info = {0};
     uint8_t *save_buf = NULL;
     uint8_t *verify_buf = NULL;
+    uint32_t before_crc = 0;
+    uint32_t expected_crc = 0;
+    uint32_t after_crc = 0;
 
     if (ok) {
-        save_info = detect_save_info();
+        save_info = detect_save_info(&cart);
 
         print_header();
         print_loc(LOC.clear_title);
@@ -3611,7 +4340,7 @@ void clear_cart_save(void) {
         printf(LOC.cart_save_bytes, save_info.name, (unsigned)save_info.size);
         print_loc(LOC.clear_warning);
         print_loc(LOC.prompt_continue_cancel);
-        console_render();
+        shark_console_render();
 
         if (!wait_for_a_or_b()) {
             ok = false;
@@ -3623,7 +4352,7 @@ void clear_cart_save(void) {
         print_loc(LOC.clear_title);
         print_loc(LOC.clear_second_warning);
         print_loc(LOC.prompt_clear_second);
-        console_render();
+        shark_console_render();
 
         if (!wait_for_clear_combo_or_b()) {
             ok = false;
@@ -3635,20 +4364,33 @@ void clear_cart_save(void) {
         verify_buf = malloc(save_info.size);
         if (save_buf == NULL || verify_buf == NULL) {
             printf(LOC.err_alloc_save, errno);
-            console_render();
+            shark_console_render();
             ok = false;
             pause_after_error();
         }
     }
 
     if (ok) {
-        memset(save_buf, 0xFF, save_info.size);
+        if (!read_save_data(verify_buf, &save_info)) {
+            print_loc(LOC.err_read_save_data);
+            shark_console_render();
+            ok = false;
+            pause_after_error();
+        }
+    }
+
+    if (ok) {
+        before_crc = crc32_buffer(verify_buf, save_info.size);
+        memset(save_buf, clear_save_fill_byte(&save_info), save_info.size);
+        expected_crc = crc32_buffer(save_buf, save_info.size);
 
         print_header();
         printf(LOC.clearing_save, save_info.name, (unsigned)save_info.size);
-        console_render();
+        printf("Before:%08" PRIX32 "\n", before_crc);
+        printf("Want:  %08" PRIX32 "\n", expected_crc);
+        shark_console_render();
 
-        if (!write_save_data_to_cart(save_buf, &save_info)) {
+        if (!clear_save_data_on_cart(save_buf, &save_info)) {
             ok = false;
             pause_after_error();
         }
@@ -3656,12 +4398,20 @@ void clear_cart_save(void) {
 
     if (ok) {
         print_loc(LOC.verifying);
-        console_render();
+        shark_console_render();
 
-        if (!read_save_data(verify_buf, &save_info) ||
-            memcmp(save_buf, verify_buf, save_info.size) != 0) {
+        const bool read_ok = read_save_data(verify_buf, &save_info);
+        after_crc = read_ok ? crc32_buffer(verify_buf, save_info.size) : 0;
+        if (!read_ok || memcmp(save_buf, verify_buf, save_info.size) != 0) {
+            const size_t diff = read_ok ? first_diff_offset(save_buf, verify_buf, save_info.size) : 0;
             print_header();
             print_loc(LOC.clear_verify_failed);
+            printf("Before:%08" PRIX32 "\n", before_crc);
+            printf("Want:  %08" PRIX32 "\n", expected_crc);
+            printf("After: %08" PRIX32 "\n", after_crc);
+            if (read_ok) {
+                printf("Diff:  %06X\n", (unsigned)diff);
+            }
             ok = false;
             pause_after_error();
         }
@@ -3670,8 +4420,11 @@ void clear_cart_save(void) {
     if (ok) {
         print_header();
         print_loc(LOC.clear_success);
+        printf(LOC.cart_save_bytes, save_info.name, (unsigned)save_info.size);
+        printf("Before:%08" PRIX32 "\n", before_crc);
+        printf("After: %08" PRIX32 "\n", after_crc);
         print_loc(LOC.press_a_continue);
-        console_render();
+        shark_console_render();
         wait_for_a_press();
     }
 
@@ -3681,13 +4434,13 @@ void clear_cart_save(void) {
 }
 
 int main(void) {
-    console_init();
-    console_set_render_mode(RENDER_MANUAL);
+    shark_console_init();
+    shark_console_set_render_mode(RENDER_MANUAL);
     timer_init();
 
     if (sys_bbplayer()) {
         print_loc(LOC.err_ique);
-        console_render();
+        shark_console_render();
 
         while (true) {
             continue;
@@ -3702,7 +4455,7 @@ int main(void) {
         print_loc(LOC.main_dump_accessory);
         print_loc(LOC.main_restore);
         print_loc(LOC.main_clear_save);
-        console_render();
+        shark_console_render();
 
         poll_controller();
 

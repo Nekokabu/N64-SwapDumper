@@ -12,6 +12,8 @@
 
 #define WRITE_RETRIES 3
 
+void shark_console_render(void);
+
 static uint8_t accessory_crc5(uint16_t data11) {
     uint8_t crc = 0;
 
@@ -104,7 +106,7 @@ void accessory_dump_stream(joypad_port_t port, size_t cart_size) {
         if (ret < 0) {
             printf("Write failed at offset 0x%06X (err %d)\n",
                    (unsigned)offset, ret);
-            console_render();
+            shark_console_render();
 
             return;
         }
@@ -113,13 +115,13 @@ void accessory_dump_stream(joypad_port_t port, size_t cart_size) {
 
         if (offset - last_report >= 0x80000) {
             printf("Progress: %u%%\n", (unsigned)((offset * 100) / cart_size));
-            console_render();
+            shark_console_render();
             last_report = offset;
         }
     }
 
     printf("Stream complete!\n");
-    console_render();
+    shark_console_render();
 }
 
 bool accessory_verify(joypad_port_t port, size_t cart_size) {
@@ -140,14 +142,14 @@ bool accessory_verify(joypad_port_t port, size_t cart_size) {
         int ret = accessory_read_block(port, addr, acc_buf);
         if (ret < 0) {
             printf("Verify read failed at 0x%06X\n", (unsigned)offset);
-            console_render();
+            shark_console_render();
             ok = false;
             break;
         }
 
         if (memcmp(acc_buf, cart_buf, 32) != 0) {
             printf("Mismatch at 0x%06X\n", (unsigned)offset);
-            console_render();
+            shark_console_render();
             ok = false;
         }
 
@@ -159,7 +161,7 @@ bool accessory_verify(joypad_port_t port, size_t cart_size) {
     } else {
         printf("Verify FAILED\n");
     }
-    console_render();
+    shark_console_render();
 
     return ok;
 }
