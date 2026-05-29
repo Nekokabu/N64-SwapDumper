@@ -2,6 +2,21 @@
 
 Cartridge-swap-based cartridge dumper for Nintendo 64, requiring only a flash cart. You can dump saves, ROM, or both. Inspired by and based on [sharksaver64](https://github.com/Jhynjhiruu/sharksaver64) by [@Jhynjhiruu](https://github.com/Jhynjhiruu/) [@ppcasm](https://github.com/ppcasm/) [@Modman](https://github.com/RWeick/) 
 
+# How to use
+This application works by allowing you to boot with a flash cart, and then swap to another cartridge while it's running. You can then copy data from that cartridge, and swap back to the flash cart to save it. I've only tested this on a SummerCart.
+
+#### Press A: Dump to SD
+- This allows you to dump your cartridge ROM and/or save data to the SD card of your flash cart. When selected, you will be asked to press reset and then swap to the cartridge that you want to dump. When you select this, the application will attempt to auto-detect the correct ROM size, but if it's incorrect, you can manually change it. Then you select if you want to dump the ROM, save data, or both. It's recommended that you create the folders "dump" and "dump/saves" on your SD card before attempting to dump your ROM and/or save data. When the available system memory for the ROM buffer is full, it will ask you to swap back to the flash cart and then it writes that portion of the ROM to the SD card. Then you swap back to the cartridge and continue until the entire ROM has been copied. If you are dumping only save data, then you will only need to swap to the cartridge and back to the flash cart once.
+
+#### Press B: Dump to Joybus
+- This is a planned feature. It is not functional yet.
+
+#### Press C-Up: Restore Save
+- This allows you to restore a save file from SD:/dump/saves. Press left/right to select a save and then press A to continue. You will be asked to press reset and then swap to the cartridge that you want to use. It will only allow you to restore a save where the filename matches the product code in the cartridge header. For example, CZL*.sav for The Legend of Zelda: Ocarina of Time. If you're trying to restore a save that you dumped using this application, it should already have the correct name, but if not, you can try using the dump feature to find the product code for your cartridge and rename your save to match.
+
+#### Press Z+Down: Clear Save
+- This allows you to erase the save data on a cartridge. You will be asked to press reset and then swap to the cartridge that you want to erase. It will then ask if you're sure, and then ask you to press Z+L+Start to make sure that this isn't happening accidentally.
+
 ## Disclaimer
 
 THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED. BY USING THIS SOFTWARE YOU ACKNOWLEDGE AND AGREE THAT:
