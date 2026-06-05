@@ -31,6 +31,18 @@ static int shark_errno = 0;
 
 #define printf iprintf
 
+#ifndef VI_AA_MODE_MASK
+#define VI_AA_MODE_MASK        0x00000300
+#endif
+
+#ifndef PI_STATUS_DMA_BUSY
+#define PI_STATUS_DMA_BUSY     0x00000001
+#endif
+
+#ifndef PI_STATUS_IO_BUSY
+#define PI_STATUS_IO_BUSY      0x00000002
+#endif
+
 #define CART_ROM_BASE 0x10000000
 #define CART_HEADER_SIZE 0x40
 #define CART_TITLE_OFFSET 0x20
