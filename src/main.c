@@ -17,6 +17,7 @@
 #include "pif.h"
 #include "tom_thumb_font.h"
 
+
 #ifdef debug_init_sdfs
 #undef debug_init_sdfs
 #endif
@@ -30,6 +31,18 @@ static int shark_errno = 0;
 #define EBUSY 16
 
 #define printf iprintf
+
+#ifndef VI_AA_MODE_MASK
+#define VI_AA_MODE_MASK        0x00000300
+#endif
+
+#ifndef PI_STATUS_DMA_BUSY
+#define PI_STATUS_DMA_BUSY     0x00000001
+#endif
+
+#ifndef PI_STATUS_IO_BUSY
+#define PI_STATUS_IO_BUSY      0x00000002
+#endif
 
 #define CART_ROM_BASE 0x10000000
 #define CART_HEADER_SIZE 0x40
@@ -337,6 +350,7 @@ typedef struct {
     const char *prompt_continue_cancel;
     const char *prompt_resume_dump;
     const char *prompt_retry_reinsert;
+    const char *prompt_ignore_crc;
     const char *prompt_reset_now;
     const char *prompt_swap;
     const char *prompt_flashcart_retry;
@@ -475,6 +489,7 @@ static const loc_t LOC = {
     .prompt_continue_cancel = "A:OK - B:Back\n",
     .prompt_resume_dump = "A:Resume - B:Start Over\n",
     .prompt_retry_reinsert = "Reinsert cart+press A\n",
+    .prompt_ignore_crc = "CRC BAD, Ignore CRC then press A\n\n",
     .prompt_reset_now = "Press RESET now\n",
     .prompt_swap = "Swap- then press A\n",
     .prompt_flashcart_retry = "Flashcart init failed\nA: retry\n",
@@ -1898,10 +1913,14 @@ static bool wait_for_valid_game_cart(uint8_t *scratch, size_t scratch_size, uint
                        crc.calculated_crc1, crc.calculated_crc2, crc.cic_name);
             }
         }
-
-        print_loc(LOC.prompt_retry_reinsert);
+        print_loc(LOC.prompt_ignore_crc);
         shark_console_render();
         wait_for_a_press();
+        memcpy(out_header, header, CART_HEADER_SIZE);
+        return true;
+        //print_loc(LOC.prompt_retry_reinsert);
+        //shark_console_render();
+        //wait_for_a_press();
     }
 }
 
