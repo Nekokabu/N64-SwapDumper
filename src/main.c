@@ -177,6 +177,11 @@ static int shark_errno = 0;
 #define PART_PATH_LEN 64
 #define PART_META_MAGIC 0x53445054u
 #define PART_META_VERSION 1u
+#define PART_META_VERSION_ADV 2u
+#define ADV_ADDR_DIGITS 8
+#define ADV_REPEAT_DELAY_FRAMES 25
+#define ADV_REPEAT_INTERVAL_FRAMES 5
+#define PI_BOUNCE_SIZE 16
 
 joypad_inputs_t inputs = {0}, prev_inputs;
 #define INPUT(inp) ((inputs.inp) && !(prev_inputs.inp))
@@ -212,6 +217,8 @@ typedef enum {
     DUMP_MODE_ROM_ONLY,
     DUMP_MODE_SAVE_ONLY,
     DUMP_MODE_ROM_AND_SAVE,
+    DUMP_MODE_ROM_ADV,
+    DUMP_MODE_COUNT,
 } dump_mode_t;
 
 typedef enum {
@@ -325,11 +332,15 @@ typedef struct {
     uint32_t version;
     char product[CART_PRODUCT_LENGTH + 1];
     uint8_t revision;
-    uint8_t reserved[3];
+    uint8_t adv;
+    uint8_t reserved[2];
     uint32_t rom_size;
     uint32_t offset;
     uint32_t cart_crc32;
+    uint32_t base_addr;
 } dump_part_meta_t;
+
+#define PART_META_V1_SIZE offsetof(dump_part_meta_t, base_addr)
 
 typedef struct {
     char name[PART_NAME_LEN];
@@ -381,6 +392,12 @@ typedef struct {
     const char *mode_rom_only;
     const char *mode_save_only;
     const char *mode_rom_save;
+    const char *mode_rom_adv;
+    const char *adv_addr_size;
+    const char *adv_prompt;
+    const char *adv_end;
+    const char *adv_end_over;
+    const char *adv_addr_line;
     const char *flash_restore_unsupported;
     const char *flash_erasing;
     const char *flash_programming;
@@ -479,7 +496,7 @@ static const char LOC_GENERIC_ERROR[] = "Err\n";
 
 static const loc_t LOC = {
     .generic_error = LOC_GENERIC_ERROR,
-    .app_header = "N64SwapDumper v0.3(Shrk)\n",
+    .app_header = "N64SwapDumper v0.4(Shrk)\n",
     .newline = "\n",
     .revision_suffix_fmt = " (%c)",
     .press_a_continue = "A: OK\n",
@@ -520,6 +537,12 @@ static const loc_t LOC = {
     .mode_rom_only = "ROM",
     .mode_save_only = "Save",
     .mode_rom_save = "Both",
+    .mode_rom_adv = "ROM(ADV.)",
+    .adv_addr_size = "Addr:%08" PRIX32 " Size:%uMB\n",
+    .adv_prompt = "Dpad:Edit A:OK B:Back\n",
+    .adv_end = "End :%08" PRIX32 "\n",
+    .adv_end_over = "End :over FFFFFFFF\n",
+    .adv_addr_line = "Addr:%08" PRIX32,
     .flash_restore_unsupported = LOC_GENERIC_ERROR,
     .flash_erasing = "Erase Flash %u/%u\n",
     .flash_programming = "Write Flash %u/%u\n",
@@ -615,6 +638,9 @@ static const loc_t LOC = {
 };
 
 static dump_progress_t dprog;
+/* ROM(ADV.): dump from an arbitrary PI address instead of CART_ROM_BASE. */
+static bool rom_adv_mode = false;
+static uint32_t rom_adv_base = CART_ROM_BASE;
 static bool dump_abort_requested = false;
 
 static char sdfs_prefix[] = "sd:/";
@@ -899,6 +925,7 @@ static joypad_inputs_t read_controller(void) {
         out.btn.r = data.c[0].R;
         out.btn.start = data.c[0].start;
         out.btn.c_up = data.c[0].C_up;
+        out.btn.d_up = data.c[0].up;
         out.btn.d_down = data.c[0].down;
         out.btn.d_left = data.c[0].left;
         out.btn.d_right = data.c[0].right;
@@ -918,6 +945,7 @@ static joypad_inputs_t read_controller_combined(void) {
     out.btn.r |= btn.r;
     out.btn.start |= btn.start;
     out.btn.c_up |= btn.c_up;
+    out.btn.d_up |= btn.d_up;
     out.btn.d_down |= btn.d_down;
     out.btn.d_left |= btn.d_left;
     out.btn.d_right |= btn.d_right;
@@ -953,6 +981,15 @@ static void set_dom1_pi_config(uint32_t config) {
     *PI_BSD_DOM1_PWD_REG = config >> 8;
     *PI_BSD_DOM1_PGS_REG = config >> 16;
     *PI_BSD_DOM1_RLS_REG = config >> 20;
+    MEMORY_BARRIER();
+}
+
+static void set_dom2_pi_config(uint32_t config) {
+    wait_pi_idle();
+    *PI_BSD_DOM2_LAT_REG = config >> 0;
+    *PI_BSD_DOM2_PWD_REG = config >> 8;
+    *PI_BSD_DOM2_PGS_REG = config >> 16;
+    *PI_BSD_DOM2_RLS_REG = config >> 20;
     MEMORY_BARRIER();
 }
 
@@ -1030,8 +1067,20 @@ static void append_path_text(char *out, size_t out_size, size_t *pos, const char
     }
 }
 
-static void format_cart_file_path(char *out, size_t out_size, const cart_info_t *info,
-                                  const char *dir, const char *ext) {
+/* Characters FAT does not accept in a file name (a broken or open-bus
+ * header can put them into the product code). */
+static char filename_safe_char(char ch) {
+    switch (ch) {
+        case '"': case '*': case '/': case ':': case '<':
+        case '>': case '?': case '\\': case '|':
+            return '_';
+        default:
+            return ch;
+    }
+}
+
+static void format_cart_file_path_tagged(char *out, size_t out_size, const cart_info_t *info,
+                                         const char *dir, const char *tag, const char *ext) {
     const char suffix = revision_suffix(info->revision);
     size_t pos = 0;
     if (out_size != 0) {
@@ -1040,12 +1089,42 @@ static void format_cart_file_path(char *out, size_t out_size, const cart_info_t 
 
     append_path_text(out, out_size, &pos, dir);
     append_path_char(out, out_size, &pos, '/');
-    append_path_text(out, out_size, &pos, info->product);
+    for (const char *p = info->product; *p != '\0'; p++) {
+        append_path_char(out, out_size, &pos, filename_safe_char(*p));
+    }
     if (suffix != '\0') {
         append_path_char(out, out_size, &pos, suffix);
     }
+    if (tag != NULL) {
+        append_path_text(out, out_size, &pos, tag);
+    }
     append_path_char(out, out_size, &pos, '.');
     append_path_text(out, out_size, &pos, ext);
+}
+
+static void format_cart_file_path(char *out, size_t out_size, const cart_info_t *info,
+                                  const char *dir, const char *ext) {
+    format_cart_file_path_tagged(out, out_size, info, dir, NULL, ext);
+}
+
+/* ROM dump file: "<product><rev>.z64", or for ROM(ADV.)
+ * "<product><rev>_<address>.bin" so it never collides with a normal dump. */
+static void format_rom_dump_path(char *out, size_t out_size, const cart_info_t *info,
+                                 const char *dir, bool adv, uint32_t base_addr) {
+    static const char hex[] = "0123456789ABCDEF";
+    char tag[ADV_ADDR_DIGITS + 2];
+
+    if (!adv) {
+        format_cart_file_path(out, out_size, info, dir, "z64");
+        return;
+    }
+
+    tag[0] = '_';
+    for (int i = 0; i < ADV_ADDR_DIGITS; i++) {
+        tag[1 + i] = hex[(base_addr >> ((ADV_ADDR_DIGITS - 1 - i) * 4)) & 0xF];
+    }
+    tag[ADV_ADDR_DIGITS + 1] = '\0';
+    format_cart_file_path_tagged(out, out_size, info, dir, tag, "bin");
 }
 
 static void set_cart_paths(cart_info_t *info) {
@@ -1081,6 +1160,78 @@ static void parse_cart_info(cart_info_t *info, const uint8_t *header) {
 static void cart_dma_read(void *ram, size_t cart_offset, size_t len) {
     data_cache_hit_writeback_invalidate(ram, len);
     dma_read(ram, CART_ROM_BASE + cart_offset, len);
+}
+
+/* Read up to PI_BOUNCE_SIZE - 1 bytes through an aligned bounce buffer.
+ * Used for the unaligned head/tail of a transfer. */
+static void pi_dma_read_small(uint8_t *dst, uint32_t pi_addr, size_t len) {
+    static uint8_t bounce[PI_BOUNCE_SIZE] __attribute__((aligned(16)));
+    const size_t skip = pi_addr & 1;
+    const size_t dma_len = (skip + len + 1) & ~(size_t)1;
+
+    data_cache_hit_writeback_invalidate(bounce, sizeof(bounce));
+    dma_read_raw_async(bounce, pi_addr - skip, dma_len);
+    dma_wait();
+    memcpy(dst, bounce + skip, len);
+}
+
+/* PI DMA read from any 32-bit PI address. libdragon's dma_read() forces the
+ * address into 0x10000000-0x1FFFFFFF, so the raw DMA is used here. The body
+ * of the transfer is always 8-byte aligned in RDRAM, starts at an even PI
+ * address and has an even length; the rest goes through the bounce buffer. */
+static void pi_dma_read_any(void *ram_ptr, uint32_t pi_addr, size_t len) {
+    uint8_t *ram = UncachedAddr(ram_ptr);
+
+    if (len == 0) {
+        return;
+    }
+
+    data_cache_hit_writeback_invalidate(ram_ptr, len);
+
+    size_t head = (8 - ((uintptr_t)ram & 7)) & 7;
+    if (head > len) {
+        head = len;
+    }
+    if (head != 0) {
+        pi_dma_read_small(ram, pi_addr, head);
+        ram += head;
+        pi_addr += head;
+        len -= head;
+    }
+
+    if (pi_addr & 1) {
+        /* RDRAM and PI address parity differ: no direct DMA possible. */
+        while (len != 0) {
+            const size_t part = len < 8 ? len : 8;
+            pi_dma_read_small(ram, pi_addr, part);
+            ram += part;
+            pi_addr += part;
+            len -= part;
+        }
+        return;
+    }
+
+    const size_t body = len & ~(size_t)1;
+    if (body != 0) {
+        dma_read_raw_async(ram, pi_addr, body);
+        dma_wait();
+    }
+    if (len & 1) {
+        pi_dma_read_small(ram + body, pi_addr + body, 1);
+    }
+}
+
+/* ROM data read used by the dump itself (checksum and data passes).
+ * Header, CRC and size probing always stay on CART_ROM_BASE. */
+static void rom_dump_read(void *ram, size_t rom_offset, size_t len) {
+    if (!rom_adv_mode) {
+        cart_dma_read(ram, rom_offset, len);
+        return;
+    }
+
+    /* 0x05000000-0x05FFFFFF and 0x08000000-0x0FFFFFFF use the DOM2 timing. */
+    set_dom2_pi_config(CART_SAFE_PI_CONFIG);
+    pi_dma_read_any(ram, rom_adv_base + (uint32_t)rom_offset, len);
 }
 
 static void cart_dom2_read(void *ram, size_t cart_offset, size_t len) {
@@ -2108,13 +2259,15 @@ static const char *dump_mode_name(dump_mode_t mode) {
         case DUMP_MODE_ROM_ONLY: return LOC.mode_rom_only;
         case DUMP_MODE_SAVE_ONLY: return LOC.mode_save_only;
         case DUMP_MODE_ROM_AND_SAVE: return LOC.mode_rom_save;
+        case DUMP_MODE_ROM_ADV: return LOC.mode_rom_adv;
+        case DUMP_MODE_COUNT: break;
     }
 
     return LOC.mode_rom_only;
 }
 
 static bool select_dump_mode(dump_mode_t *mode) {
-    int selected = DUMP_MODE_ROM_AND_SAVE;
+    int selected = (int)*mode;
 
     while (true) {
         print_header();
@@ -2131,11 +2284,11 @@ static bool select_dump_mode(dump_mode_t *mode) {
             poll_controller();
 
             if (INPUT(btn.d_left)) {
-                selected = (selected + 2) % 3;
+                selected = (selected + DUMP_MODE_COUNT - 1) % DUMP_MODE_COUNT;
                 break;
             }
             if (INPUT(btn.d_right)) {
-                selected = (selected + 1) % 3;
+                selected = (selected + 1) % DUMP_MODE_COUNT;
                 break;
             }
             if (INPUT(btn.a)) {
@@ -2147,6 +2300,87 @@ static bool select_dump_mode(dump_mode_t *mode) {
             }
 
             wait_ms(16);
+        }
+    }
+}
+
+/* ROM(ADV.): edit the 8-digit dump start address.
+ * D-pad left/right moves the cursor, up/down changes the digit (auto-repeat
+ * while held). Bit 0 is kept clear because the PI DMA ignores it. */
+static bool select_dump_address(uint32_t *addr, size_t size) {
+    uint32_t value = *addr & ~(uint32_t)1;
+    int digit = 0;
+    int hold = 0;
+    bool redraw = true;
+
+    do {
+        poll_controller();
+        wait_ms(16);
+    } while (inputs.btn.a || inputs.btn.b);
+
+    while (true) {
+        const bool in_range = ((uint64_t)value + size) <= 0x100000000ull;
+
+        if (redraw) {
+            print_header();
+            printf(LOC.adv_addr_size, value, (unsigned)(size / 0x100000));
+            for (int i = 0; i < 5 + digit; i++) {
+                putchar(' ');
+            }
+            print_loc("^\n");
+            print_loc(LOC.adv_prompt);
+            if (in_range) {
+                printf(LOC.adv_end, (uint32_t)(value + (uint32_t)size - 1));
+            } else {
+                print_loc(LOC.adv_end_over);
+            }
+            shark_console_render();
+            redraw = false;
+        }
+
+        wait_ms(16);
+        poll_controller();
+
+        int step = 0;
+        if (inputs.btn.d_up != inputs.btn.d_down) {
+            const int dir = inputs.btn.d_up ? 1 : -1;
+            if (hold == 0) {
+                step = dir;
+            } else if (hold >= ADV_REPEAT_DELAY_FRAMES &&
+                       ((hold - ADV_REPEAT_DELAY_FRAMES) % ADV_REPEAT_INTERVAL_FRAMES) == 0) {
+                step = dir;
+            }
+            hold++;
+        } else {
+            hold = 0;
+        }
+
+        if (step != 0) {
+            const int shift = (ADV_ADDR_DIGITS - 1 - digit) * 4;
+            uint32_t nibble = (value >> shift) & 0xF;
+            if (shift == 0) {
+                nibble = (nibble + (uint32_t)(step * 2)) & 0xE;
+            } else {
+                nibble = (nibble + (uint32_t)step) & 0xF;
+            }
+            value = (value & ~((uint32_t)0xF << shift)) | (nibble << shift);
+            redraw = true;
+        }
+
+        if (INPUT(btn.d_left)) {
+            digit = (digit + ADV_ADDR_DIGITS - 1) % ADV_ADDR_DIGITS;
+            redraw = true;
+        } else if (INPUT(btn.d_right)) {
+            digit = (digit + 1) % ADV_ADDR_DIGITS;
+            redraw = true;
+        }
+
+        if (INPUT(btn.a) && in_range) {
+            *addr = value;
+            return true;
+        }
+        if (INPUT(btn.b)) {
+            return false;
         }
     }
 }
@@ -2577,7 +2811,7 @@ static bool checksum_cart_rom(uint8_t *buf, size_t buf_size, size_t rom_size,
     while (offset < rom_size) {
         const size_t len = checksum_read_len(buf_size, rom_size - offset);
 
-        cart_dma_read(buf, offset, len);
+        rom_dump_read(buf, offset, len);
         crc = crc32_update(crc, buf, len);
         offset += len;
 
@@ -2921,9 +3155,18 @@ static bool read_part_meta(const char *path, dump_part_meta_t *meta) {
         return false;
     }
 
-    const bool ok = read_all(fd, (uint8_t *)meta, sizeof(*meta)) &&
-                    meta->magic == PART_META_MAGIC &&
-                    meta->version == PART_META_VERSION;
+    /* v1: normal dump (v0.3 compatible). v2: ROM(ADV.), base_addr appended. */
+    bool ok = read_all(fd, (uint8_t *)meta, PART_META_V1_SIZE) &&
+              meta->magic == PART_META_MAGIC;
+    if (ok && meta->version == PART_META_VERSION) {
+        meta->adv = 0;
+        meta->base_addr = CART_ROM_BASE;
+    } else if (ok && meta->version == PART_META_VERSION_ADV) {
+        ok = read_all(fd, (uint8_t *)&meta->base_addr, sizeof(meta->base_addr));
+        meta->adv = 1;
+    } else {
+        ok = false;
+    }
     close(fd);
     return ok;
 }
@@ -2933,12 +3176,17 @@ static bool part_matches_cart(const part_file_t *file, const cart_info_t *cart,
     char expected_rom[sizeof(cart->rom_path)];
     char expected_part[PART_NAME_LEN];
 
-    format_cart_file_path(expected_rom, sizeof(expected_rom), cart, "sd:", "z64");
+    if (!file->meta_valid) {
+        return false;
+    }
+
+    format_rom_dump_path(expected_rom, sizeof(expected_rom), cart, "sd:",
+                         file->meta.adv != 0, file->meta.base_addr);
     if (!append_part_suffix(expected_part, sizeof(expected_part), path_basename(expected_rom))) {
         return false;
     }
 
-    if (!file->meta_valid || !ascii_streq_casefold(file->name, expected_part)) {
+    if (!ascii_streq_casefold(file->name, expected_part)) {
         return false;
     }
 
@@ -2986,6 +3234,7 @@ static bool find_resume_part_direct(const cart_info_t *cart, dump_part_meta_t *m
         }
 
         if (!read_part_meta(expected_part, meta) ||
+            meta->adv != 0 ||
             !ascii_streq_casefold(meta->product, cart->product) ||
             meta->revision != cart->revision ||
             meta->rom_size == 0 ||
@@ -3003,8 +3252,12 @@ static bool find_resume_part_direct(const cart_info_t *cart, dump_part_meta_t *m
 static bool confirm_resume_dump(const cart_info_t *cart, const dump_part_meta_t *meta) {
     print_header();
     print_loc(LOC.resume_title);
-    printf(LOC.title_label, cart->title);
-    print_revision_suffix(cart->revision);
+    if (meta->adv) {
+        printf(LOC.adv_addr_line, meta->base_addr);
+    } else {
+        printf(LOC.title_label, cart->title);
+        print_revision_suffix(cart->revision);
+    }
     print_loc(LOC.newline);
     printf(LOC.resume_offset,
            (unsigned)(meta->offset / 0x100000),
@@ -3018,19 +3271,22 @@ static bool write_part_meta(const cart_info_t *cart, size_t offset, uint32_t car
     char part_path[PART_PATH_LEN];
     dump_part_meta_t meta = {
         .magic = PART_META_MAGIC,
-        .version = PART_META_VERSION,
+        .version = rom_adv_mode ? PART_META_VERSION_ADV : PART_META_VERSION,
         .revision = cart->revision,
+        .adv = rom_adv_mode ? 1 : 0,
         .rom_size = (uint32_t)cart->selected_size,
         .offset = (uint32_t)offset,
         .cart_crc32 = cart_crc32,
+        .base_addr = rom_adv_mode ? rom_adv_base : CART_ROM_BASE,
     };
+    const size_t meta_size = rom_adv_mode ? sizeof(meta) : PART_META_V1_SIZE;
 
     memcpy(meta.product, cart->product, sizeof(meta.product));
     if (!append_part_suffix(part_path, sizeof(part_path), cart->rom_path)) {
         return false;
     }
 
-    return write_sd_file_to_path(part_path, (const uint8_t *)&meta, sizeof(meta), false, 0, true);
+    return write_sd_file_to_path(part_path, (const uint8_t *)&meta, meta_size, false, 0, true);
 }
 
 static void delete_part_meta(const cart_info_t *cart) {
@@ -3186,8 +3442,12 @@ static void draw_dump_progress(void) {
     print_loc(LOC.app_header);
 
     if (dprog.cart) {
-        printf(LOC.progress_title_line, dprog.cart->title);
-        print_revision_suffix(dprog.cart->revision);
+        if (rom_adv_mode) {
+            printf(LOC.adv_addr_line, rom_adv_base);
+        } else {
+            printf(LOC.progress_title_line, dprog.cart->title);
+            print_revision_suffix(dprog.cart->revision);
+        }
         print_loc(LOC.newline);
         printf(LOC.progress_size,
                (unsigned)(dprog.total_size / 0x100000));
@@ -3365,7 +3625,7 @@ static bool compress_cart_pass(uint8_t *comp_buf, size_t comp_cap,
         uint8_t *const payload_buf = comp_buf + out_pos;
         uint8_t *const raw_buf = compress ? work.scratch_buf : payload_buf;
 
-        cart_dma_read(raw_buf, raw_pos, block_len);
+        rom_dump_read(raw_buf, raw_pos, block_len);
 
         size_t payload_size = 0;
         uint32_t flags = 0;
@@ -3453,7 +3713,7 @@ static bool compress_cart_pass(uint8_t *comp_buf, size_t comp_cap,
             continue;
         }
 
-        cart_dma_read(tail_bufs[i], raw_pos, tail_len);
+        rom_dump_read(tail_bufs[i], raw_pos, tail_len);
         raw_pos += tail_len;
         pass->raw_size += tail_len;
         pass->raw_tail_size[i] = tail_len;
@@ -3627,7 +3887,7 @@ static bool write_rom_pass_to_sd(cart_info_t *cart, uint8_t *comp_buf,
                                            true, false, NULL);
     }
 
-    format_cart_file_path(path, sizeof(path), cart, ROM_DUMP_DIR, "z64");
+    format_rom_dump_path(path, sizeof(path), cart, ROM_DUMP_DIR, rom_adv_mode, rom_adv_base);
     bool opened = false;
     if (write_compressed_pass_to_sd(path, comp_buf, pass,
                                     block_size, scratch_buf, scratch_size,
@@ -3640,7 +3900,7 @@ static bool write_rom_pass_to_sd(cart_info_t *cart, uint8_t *comp_buf,
         return false;
     }
 
-    format_cart_file_path(path, sizeof(path), cart, "sd:", "z64");
+    format_rom_dump_path(path, sizeof(path), cart, "sd:", rom_adv_mode, rom_adv_base);
     strcpy(cart->rom_path, path);
     return write_compressed_pass_to_sd(cart->rom_path, comp_buf, pass,
                                        block_size, scratch_buf, scratch_size,
@@ -3799,6 +4059,8 @@ void dump_rom(void) {
     bool first_pass = true;
     bool ok = true;
 
+    rom_adv_mode = false;
+
     crc_buf = malloc(CART_CHECKSUM_IMAGE_SIZE);
     if (crc_buf == NULL) {
         printf(LOC.err_alloc_crc, errno);
@@ -3846,6 +4108,10 @@ void dump_rom(void) {
             cart_full_crc = resume_meta.cart_crc32;
             have_cart_full_crc = cart_full_crc != 0;
             dump_mode = DUMP_MODE_ROM_ONLY;
+            if (resume_meta.adv) {
+                rom_adv_mode = true;
+                rom_adv_base = resume_meta.base_addr;
+            }
             resume_dump = true;
         }
     }
@@ -3856,9 +4122,25 @@ void dump_rom(void) {
         part_count = 0;
     }
 
-    if (ok && !resume_dump &&
-        (!select_rom_size(&cart) || !select_dump_mode(&dump_mode))) {
+    if (ok && !resume_dump && !select_rom_size(&cart)) {
         ok = false;
+    }
+
+    while (ok && !resume_dump) {
+        if (!select_dump_mode(&dump_mode)) {
+            ok = false;
+            break;
+        }
+        if (dump_mode != DUMP_MODE_ROM_ADV) {
+            break;
+        }
+        /* B on the address screen goes back to the mode selection. */
+        if (select_dump_address(&rom_adv_base, cart.selected_size)) {
+            rom_adv_mode = true;
+            dump_mode = DUMP_MODE_ROM_ONLY;
+            print_header();
+            break;
+        }
     }
 
     if (ok && dump_mode != DUMP_MODE_ROM_ONLY) {

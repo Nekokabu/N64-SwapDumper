@@ -8,6 +8,13 @@ This application works by allowing you to boot with a flash cart, and then swap 
 #### Press A: Dump to SD
 - This allows you to dump your cartridge ROM and/or save data to the SD card of your flash cart. When selected, you will be asked to press reset and then swap to the cartridge that you want to dump. When you select this, the application will attempt to auto-detect the correct ROM size, but if it's incorrect, you can manually change it. Then you select if you want to dump the ROM, save data, or both. It's recommended that you create the folders "dump" and "dump/saves" on your SD card before attempting to dump your ROM and/or save data. When the available system memory for the ROM buffer is full, it will ask you to swap back to the flash cart and then it writes that portion of the ROM to the SD card. Then you swap back to the cartridge and continue until the entire ROM has been copied. If you are dumping only save data, then you will only need to swap to the cartridge and back to the flash cart once.
 
+#### Dump mode: ROM(ADV.)
+- The dump mode selection (D-pad left/right) has a fourth entry, `ROM(ADV.)`, next to `ROM`, `Save` and `Both`. It dumps from an arbitrary PI address instead of the fixed `0x10000000`.
+- After selecting it, the next screen edits the 8-digit start address: D-pad left/right moves the cursor, D-pad up/down changes the digit (hold to repeat), A confirms, B returns to the mode selection. The lowest bit is always 0 because the PI DMA ignores it. The dump length is the ROM size chosen on the previous screen, and the address is refused while start + size exceeds `0xFFFFFFFF`.
+- The header check, CRC check and size detection still use `0x10000000`; only the data that is dumped (and its CRC32 verification) comes from the selected address.
+- The file is written as `<product><rev>_<address>.bin` (for example `NZLE_1FD00000.bin`) so it does not overwrite a normal dump. Interrupted `ROM(ADV.)` dumps can be resumed like normal ones.
+- Data is read with raw PI DMA. Addresses in `0x05000000-0x05FFFFFF` and `0x08000000-0x0FFFFFFF` use the PI DOM2 timing, which is set to the slowest setting in this mode; all other addresses use the DOM1 timing chosen from the cartridge header.
+
 #### Press B: Dump to Joybus
 - This is a planned feature. It is not functional yet.
 
@@ -28,3 +35,6 @@ THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPL
 
 Human version: While I've tested this repeatedly and caused no damage to any of my hardware or cartridges, it is not recommended that you use this if you are worried about damaging your console. I reckon that it's particularly risky if your system has been modified to remove the region keyed cartridge tray insert, as its absense may make it easier for the cartridge to be inserted out of alignment, causing cartridge pins to connect to the wrong slot pins or bridge them together, etc. It's also not recommended if you use a bare PCB flash cart or game cartridge, or if your situation has any other factors that might allow the cartridge to be inserted crooked, off-center, etc. Use the software at your own risk! You have been warned!
 
+## Changes
+
+- v0.4 (Nekokabu): added the `ROM(ADV.)` dump mode (arbitrary dump start address). Product codes containing characters that FAT does not allow are now written with `_` in file names.
